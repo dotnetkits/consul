@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"github.com/hashicorp/go-memdb"
 	"io"
 	"io/ioutil"
 	"log"
@@ -19,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hashicorp/go-memdb"
 
 	"google.golang.org/grpc"
 
@@ -1203,6 +1204,7 @@ func (a *Agent) consulConfig() (*consul.Config, error) {
 	base.AutopilotConfig.CleanupDeadServers = a.config.AutopilotCleanupDeadServers
 	base.AutopilotConfig.LastContactThreshold = a.config.AutopilotLastContactThreshold
 	base.AutopilotConfig.MaxTrailingLogs = uint64(a.config.AutopilotMaxTrailingLogs)
+	base.AutopilotConfig.MinQuorum = a.config.AutopilotMinQuorum
 	base.AutopilotConfig.ServerStabilizationTime = a.config.AutopilotServerStabilizationTime
 	base.AutopilotConfig.RedundancyZoneTag = a.config.AutopilotRedundancyZoneTag
 	base.AutopilotConfig.DisableUpgradeMigration = a.config.AutopilotDisableUpgradeMigration
