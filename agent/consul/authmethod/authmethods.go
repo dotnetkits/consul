@@ -1,19 +1,39 @@
 package authmethod
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"sync"
 
 	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/go-hclog"
 	"github.com/mitchellh/mapstructure"
 )
 
-type ValidatorFactory func(method *structs.ACLAuthMethod) (Validator, error)
+type Cache interface {
+	// GetValidator retrieves the Validator from the cache.
+	// It returns the modify index of struct that the validator was created from,
+	// the validator and a boolean indicating whether the value was found
+	GetValidator(method *structs.ACLAuthMethod) (uint64, Validator, bool)
+
+	// PutValidatorIfNewer inserts a new validator into the cache if the index is greater
+	// than the modify index of any existing entry in the cache. This method will return
+	// the newest validator which may or may not be the one from the method parameter
+	PutValidatorIfNewer(method *structs.ACLAuthMethod, validator Validator, idx uint64) Validator
+
+	// Purge removes all cached validators
+	Purge()
+}
+
+type ValidatorFactory func(logger hclog.Logger, method *structs.ACLAuthMethod) (Validator, error)
 
 type Validator interface {
 	// Name returns the name of the auth method backing this validator.
 	Name() string
+
+	// NewIdentity creates a blank identity populated with empty values.
+	NewIdentity() *Identity
 
 	// ValidateLogin takes raw user-provided auth method metadata and ensures
 	// it is sane, provably correct, and currently valid. Relevant identifying
@@ -24,17 +44,34 @@ type Validator interface {
 	// continue to extend the life of the underlying token.
 	//
 	// Returns auth method specific metadata suitable for the Role Binding
-	// process.
-	ValidateLogin(loginToken string) (map[string]string, error)
+	// process as well as the desired enterprise meta for the token to be
+	// created.
+	ValidateLogin(ctx context.Context, loginToken string) (*Identity, error)
 
-	// AvailableFields returns a slice of all fields that are returned as a
-	// result of ValidateLogin. These are valid fields for use in any
-	// BindingRule tied to this auth method.
-	AvailableFields() []string
+	// Stop should be called to cease any background activity and free up
+	// resources.
+	Stop()
+}
 
-	// MakeFieldMapSelectable converts a field map as returned by ValidateLogin
-	// into a structure suitable for selection with a binding rule.
-	MakeFieldMapSelectable(fieldMap map[string]string) interface{}
+type Identity struct {
+	// SelectableFields is the format of this Identity suitable for selection
+	// with a binding rule.
+	SelectableFields interface{}
+
+	// ProjectedVars is the format of this Identity suitable for interpolation
+	// in a bind name within a binding rule.
+	ProjectedVars map[string]string
+
+	*structs.EnterpriseMeta
+}
+
+// ProjectedVarNames returns just the keyspace of the ProjectedVars map.
+func (i *Identity) ProjectedVarNames() []string {
+	v := make([]string, 0, len(i.ProjectedVars))
+	for k, _ := range i.ProjectedVars {
+		v = append(v, k)
+	}
+	return v
 }
 
 var (
@@ -64,10 +101,62 @@ func IsRegisteredType(typeName string) bool {
 	return ok
 }
 
+type authMethodValidatorEntry struct {
+	Validator   Validator
+	ModifyIndex uint64
+}
+
+// authMethodCache is an non-thread-safe cache that maps ACLAuthMethods to their Validators
+type authMethodCache struct {
+	entries map[string]*authMethodValidatorEntry
+}
+
+func newCache() Cache {
+	c := &authMethodCache{}
+	c.init()
+	return c
+}
+
+func (c *authMethodCache) init() {
+	c.Purge()
+}
+
+func (c *authMethodCache) GetValidator(method *structs.ACLAuthMethod) (uint64, Validator, bool) {
+	entry, ok := c.entries[method.Name]
+	if ok {
+		return entry.ModifyIndex, entry.Validator, true
+	}
+
+	return 0, nil, false
+}
+
+func (c *authMethodCache) PutValidatorIfNewer(method *structs.ACLAuthMethod, validator Validator, idx uint64) Validator {
+	prev, ok := c.entries[method.Name]
+	if ok {
+		if prev.ModifyIndex >= idx {
+			return prev.Validator
+		}
+		prev.Validator.Stop()
+	}
+
+	c.entries[method.Name] = &authMethodValidatorEntry{
+		Validator:   validator,
+		ModifyIndex: idx,
+	}
+	return validator
+}
+
+func (c *authMethodCache) Purge() {
+	for _, entry := range c.entries {
+		entry.Validator.Stop()
+	}
+	c.entries = make(map[string]*authMethodValidatorEntry)
+}
+
 // NewValidator instantiates a new Validator for the given auth method
 // configuration. If no auth method is registered with the provided type an
 // error is returned.
-func NewValidator(method *structs.ACLAuthMethod) (Validator, error) {
+func NewValidator(logger hclog.Logger, method *structs.ACLAuthMethod) (Validator, error) {
 	typesMu.RLock()
 	factory, ok := types[method.Type]
 	typesMu.RUnlock()
@@ -76,7 +165,9 @@ func NewValidator(method *structs.ACLAuthMethod) (Validator, error) {
 		return nil, fmt.Errorf("no auth method registered with type: %s", method.Type)
 	}
 
-	return factory(method)
+	logger = logger.Named("authmethod").With("type", method.Type, "name", method.Name)
+
+	return factory(logger, method)
 }
 
 // Types returns a sorted list of the names of the registered types.

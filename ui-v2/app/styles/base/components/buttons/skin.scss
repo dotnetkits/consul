@@ -1,10 +1,12 @@
 /* decor */
-%button {
+%button,
+%internal-button {
   @extend %user-select-none;
   cursor: pointer;
   white-space: nowrap;
 }
-%button:disabled {
+%button:disabled,
+%internal-button:disabled {
   cursor: default;
   box-shadow: none;
 }
@@ -13,15 +15,11 @@
   min-height: 17px;
 }
 %copy-button::before {
-  @extend %with-copy-action-icon;
-  @extend %as-pseudo;
-  width: 16px;
-  height: 16px;
-  position: absolute;
-  left: 12px;
+  @extend %with-copy-action-mask, %as-pseudo;
+  background-color: $gray-500;
 }
-%copy-button:not(:empty) {
-  padding-left: 38px !important;
+%copy-button:not(:empty)::before {
+  margin-right: 10px;
 }
 %primary-button,
 %secondary-button,
@@ -29,7 +27,7 @@
   @extend %button;
   border-width: 1px;
   border-radius: $decor-radius-100;
-  box-shadow: 0 3px 1px 0 rgba($black, 0.12);
+  box-shadow: $decor-elevation-300;
 }
 /* color */
 %copy-button {
@@ -42,7 +40,8 @@
   color: $color-action;
   background-color: $gray-050;
 }
-%copy-button:disabled {
+%copy-button:hover::before {
+  background-color: $blue-500;
 }
 %copy-button:active {
   background-color: $gray-200;
@@ -91,4 +90,46 @@
 }
 %dangerous-button:hover:active {
   @extend %frame-red-900;
+}
+
+%internal-button {
+  color: $gray-900;
+  background-color: $white;
+}
+%internal-button-dangerous {
+  @extend %frame-red-300;
+}
+%internal-button-dangerous-intent {
+  @extend %frame-red-700;
+}
+%internal-button-intent {
+  background-color: $gray-050;
+}
+%internal-button:focus,
+%internal-button:hover {
+  @extend %internal-button-intent;
+}
+%internal-button-dangerous:focus,
+%internal-button-dangerous:hover {
+  @extend %internal-button-dangerous-intent;
+}
+
+%split-button span::after {
+  @extend %as-pseudo;
+  position: absolute;
+  background-color: $gray-300;
+  width: 1px;
+  top: 0;
+  height: 100%;
+  margin-left: 8px;
+}
+%split-button::before {
+  @extend %as-pseudo;
+  height: 16px;
+}
+%sort-button::before {
+  @extend %with-sort-icon;
+  margin-top: 8px;
+  width: 16px;
+  height: 16px;
 }

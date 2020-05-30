@@ -1,6 +1,5 @@
 import RepositoryService from 'consul-ui/services/repository';
 import { get } from '@ember/object';
-import { Promise } from 'rsvp';
 import { PRIMARY_KEY, SLUG_KEY } from 'consul-ui/models/token';
 import statusFactory from 'consul-ui/utils/acls-status';
 import isValidServerErrorFactory from 'consul-ui/utils/http/acl/is-valid-server-error';
@@ -43,16 +42,18 @@ export default RepositoryService.extend({
   clone: function(item) {
     return this.store.clone(this.getModelName(), get(item, PRIMARY_KEY));
   },
-  findByPolicy: function(id, dc) {
+  findByPolicy: function(id, dc, nspace) {
     return this.store.query(this.getModelName(), {
       policy: id,
       dc: dc,
+      ns: nspace,
     });
   },
-  findByRole: function(id, dc) {
+  findByRole: function(id, dc, nspace) {
     return this.store.query(this.getModelName(), {
       role: id,
       dc: dc,
+      ns: nspace,
     });
   },
 });

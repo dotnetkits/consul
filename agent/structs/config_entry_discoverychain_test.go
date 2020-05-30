@@ -13,7 +13,6 @@ import (
 
 func TestConfigEntries_ListRelatedServices_AndACLs(t *testing.T) {
 	// This test tests both of these because they are related functions.
-	t.Parallel()
 
 	newServiceACL := func(t *testing.T, canRead, canWrite []string) acl.Authorizer {
 		var buf bytes.Buffer
@@ -24,7 +23,7 @@ func TestConfigEntries_ListRelatedServices_AndACLs(t *testing.T) {
 			buf.WriteString(fmt.Sprintf("service %q { policy = %q }\n", s, "write"))
 		}
 
-		policy, err := acl.NewPolicyFromSource("", 0, buf.String(), acl.SyntaxCurrent, nil)
+		policy, err := acl.NewPolicyFromSource("", 0, buf.String(), acl.SyntaxCurrent, nil, nil)
 		require.NoError(t, err)
 
 		authorizer, err := acl.NewPolicyAuthorizerWithDefaults(acl.DenyAll(), []*acl.Policy{policy}, nil)
@@ -67,7 +66,7 @@ func TestConfigEntries_ListRelatedServices_AndACLs(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
 		entry          discoveryChainConfigEntry
-		expectServices []string
+		expectServices []ServiceID
 		expectACLs     []testACL
 	}{
 		{
@@ -92,7 +91,7 @@ func TestConfigEntries_ListRelatedServices_AndACLs(t *testing.T) {
 					Service: "other",
 				},
 			},
-			expectServices: []string{"other"},
+			expectServices: []ServiceID{NewServiceID("other", nil)},
 			expectACLs: []testACL{
 				defaultDenyCase,
 				readTestCase,
@@ -123,7 +122,7 @@ func TestConfigEntries_ListRelatedServices_AndACLs(t *testing.T) {
 					},
 				},
 			},
-			expectServices: []string{"other1", "other2"},
+			expectServices: []ServiceID{NewServiceID("other1", nil), NewServiceID("other2", nil)},
 			expectACLs: []testACL{
 				defaultDenyCase,
 				readTestCase,
@@ -163,7 +162,7 @@ func TestConfigEntries_ListRelatedServices_AndACLs(t *testing.T) {
 					{Weight: 50, Service: "c"},
 				},
 			},
-			expectServices: []string{"a", "b", "c"},
+			expectServices: []ServiceID{NewServiceID("a", nil), NewServiceID("b", nil), NewServiceID("c", nil)},
 			expectACLs: []testACL{
 				defaultDenyCase,
 				readTestCase,
@@ -182,7 +181,7 @@ func TestConfigEntries_ListRelatedServices_AndACLs(t *testing.T) {
 				Kind: ServiceRouter,
 				Name: "test",
 			},
-			expectServices: []string{"test"},
+			expectServices: []ServiceID{NewServiceID("test", nil)},
 			expectACLs: []testACL{
 				defaultDenyCase,
 				readTestCase,
@@ -213,7 +212,7 @@ func TestConfigEntries_ListRelatedServices_AndACLs(t *testing.T) {
 					},
 				},
 			},
-			expectServices: []string{"bar", "foo", "test"},
+			expectServices: []ServiceID{NewServiceID("bar", nil), NewServiceID("foo", nil), NewServiceID("test", nil)},
 			expectACLs: []testACL{
 				defaultDenyCase,
 				readTestCase,
@@ -248,7 +247,6 @@ func TestConfigEntries_ListRelatedServices_AndACLs(t *testing.T) {
 }
 
 func TestServiceResolverConfigEntry(t *testing.T) {
-	t.Parallel()
 
 	type testcase struct {
 		name         string
@@ -538,7 +536,6 @@ func TestServiceResolverConfigEntry(t *testing.T) {
 }
 
 func TestServiceSplitterConfigEntry(t *testing.T) {
-	t.Parallel()
 
 	makesplitter := func(splits ...ServiceSplit) *ServiceSplitterConfigEntry {
 		return &ServiceSplitterConfigEntry{
@@ -723,7 +720,6 @@ func TestServiceSplitterConfigEntry(t *testing.T) {
 }
 
 func TestServiceRouterConfigEntry(t *testing.T) {
-	t.Parallel()
 
 	httpMatch := func(http *ServiceRouteHTTPMatch) *ServiceRouteMatch {
 		return &ServiceRouteMatch{HTTP: http}

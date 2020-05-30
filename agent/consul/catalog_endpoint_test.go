@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/lib"
+	"github.com/hashicorp/consul/lib/stringslice"
 	"github.com/hashicorp/consul/sdk/testutil/retry"
 	"github.com/hashicorp/consul/testrpc"
 	"github.com/hashicorp/consul/types"
@@ -162,11 +163,10 @@ func TestCatalog_Register_ACLDeny(t *testing.T) {
 		c.ACLsEnabled = true
 		c.ACLMasterToken = "root"
 		c.ACLDefaultPolicy = "deny"
-		c.ACLEnforceVersion8 = false
 	})
 	defer os.RemoveAll(dir1)
 	defer s1.Shutdown()
-	testrpc.WaitForTestAgent(t, s1.RPC, "dc1")
+	testrpc.WaitForTestAgent(t, s1.RPC, "dc1", testrpc.WithToken("root"))
 	codec := rpcClient(t, s1)
 	defer codec.Close()
 
@@ -179,6 +179,9 @@ func TestCatalog_Register_ACLDeny(t *testing.T) {
 			Type: structs.ACLTokenTypeClient,
 			Rules: `
 service "foo" {
+	policy = "write"
+}
+node "foo" {
 	policy = "write"
 }
 `,
@@ -217,17 +220,8 @@ service "foo" {
 		t.Fatalf("err: %v", err)
 	}
 
-	// Try the special case for the "consul" service that allows it no matter
-	// what with pre-version 8 ACL enforcement.
+	// Try the former special case for the "consul" service.
 	argR.Service.Service = "consul"
-	err = msgpackrpc.CallWithCodec(codec, "Catalog.Register", &argR, &outR)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	// Make sure the exception goes away when we turn on version 8 ACL
-	// enforcement.
-	s1.config.ACLEnforceVersion8 = true
 	err = msgpackrpc.CallWithCodec(codec, "Catalog.Register", &argR, &outR)
 	if !acl.IsErrPermissionDenied(err) {
 		t.Fatalf("err: %v", err)
@@ -414,6 +408,9 @@ func TestCatalog_Register_ConnectProxy_ACLDestinationServiceName(t *testing.T) {
 service "foo" {
 	policy = "write"
 }
+node "foo" {
+	policy = "write"
+}
 `,
 		},
 		WriteRequest: structs.WriteRequest{Token: "root"},
@@ -509,7 +506,6 @@ func TestCatalog_Deregister_ACLDeny(t *testing.T) {
 		c.ACLsEnabled = true
 		c.ACLMasterToken = "root"
 		c.ACLDefaultPolicy = "deny"
-		c.ACLEnforceVersion8 = false
 	})
 	defer os.RemoveAll(dir1)
 	defer s1.Shutdown()
@@ -569,8 +565,7 @@ service "service" {
 		t.Fatalf("err: %v", err)
 	}
 
-	// First pass with version 8 ACL enforcement disabled, we should be able
-	// to deregister everything even without a token.
+	// We should be not be able to deregister everything without a token.
 	var err error
 	var out struct{}
 	err = msgpackrpc.CallWithCodec(codec, "Catalog.Deregister",
@@ -578,46 +573,6 @@ service "service" {
 			Datacenter: "dc1",
 			Node:       "node",
 			CheckID:    "service-check"}, &out)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	err = msgpackrpc.CallWithCodec(codec, "Catalog.Deregister",
-		&structs.DeregisterRequest{
-			Datacenter: "dc1",
-			Node:       "node",
-			CheckID:    "node-check"}, &out)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	err = msgpackrpc.CallWithCodec(codec, "Catalog.Deregister",
-		&structs.DeregisterRequest{
-			Datacenter: "dc1",
-			Node:       "node",
-			ServiceID:  "service"}, &out)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	err = msgpackrpc.CallWithCodec(codec, "Catalog.Deregister",
-		&structs.DeregisterRequest{
-			Datacenter: "dc1",
-			Node:       "node"}, &out)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	// Turn on version 8 ACL enforcement and put the catalog entry back.
-	s1.config.ACLEnforceVersion8 = true
-	if err := msgpackrpc.CallWithCodec(codec, "Catalog.Register", &argR, &outR); err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	// Second pass with version 8 ACL enforcement enabled, these should all
-	// get rejected.
-	err = msgpackrpc.CallWithCodec(codec, "Catalog.Deregister",
-		&structs.DeregisterRequest{
-			Datacenter: "dc1",
-			Node:       "node",
-			CheckID:    "service-check"}, &out)
 	if !acl.IsErrPermissionDenied(err) {
 		t.Fatalf("err: %v", err)
 	}
@@ -645,7 +600,7 @@ service "service" {
 		t.Fatalf("err: %v", err)
 	}
 
-	// Third pass these should all go through with the token set.
+	// Second pass these should all go through with the token set.
 	err = msgpackrpc.CallWithCodec(codec, "Catalog.Deregister",
 		&structs.DeregisterRequest{
 			Datacenter: "dc1",
@@ -1236,7 +1191,6 @@ func TestCatalog_ListNodes_ACLFilter(t *testing.T) {
 		c.ACLsEnabled = true
 		c.ACLMasterToken = "root"
 		c.ACLDefaultPolicy = "deny"
-		c.ACLEnforceVersion8 = false
 	})
 	defer os.RemoveAll(dir1)
 	defer s1.Shutdown()
@@ -1249,22 +1203,10 @@ func TestCatalog_ListNodes_ACLFilter(t *testing.T) {
 	// existing slice if the incoming one is nil, so it's best to start
 	// clean each time.
 
-	// Prior to version 8, the node policy should be ignored.
+	// The node policy should not be ignored.
 	args := structs.DCSpecificRequest{
 		Datacenter: "dc1",
 	}
-	{
-		reply := structs.IndexedNodes{}
-		if err := msgpackrpc.CallWithCodec(codec, "Catalog.ListNodes", &args, &reply); err != nil {
-			t.Fatalf("err: %v", err)
-		}
-		if len(reply.Nodes) != 1 {
-			t.Fatalf("bad: %v", reply.Nodes)
-		}
-	}
-
-	// Now turn on version 8 enforcement and try again.
-	s1.config.ACLEnforceVersion8 = true
 	{
 		reply := structs.IndexedNodes{}
 		if err := msgpackrpc.CallWithCodec(codec, "Catalog.ListNodes", &args, &reply); err != nil {
@@ -2071,6 +2013,122 @@ func TestCatalog_ListServiceNodes_ConnectProxy(t *testing.T) {
 	assert.Equal(args.Service.Proxy.DestinationServiceName, v.ServiceProxy.DestinationServiceName)
 }
 
+func TestCatalog_ServiceNodes_Gateway(t *testing.T) {
+	t.Parallel()
+
+	dir1, s1 := testServer(t)
+	defer os.RemoveAll(dir1)
+	defer s1.Shutdown()
+
+	codec := rpcClient(t, s1)
+	defer codec.Close()
+
+	testrpc.WaitForTestAgent(t, s1.RPC, "dc1")
+	{
+		var out struct{}
+
+		// Register a service "api"
+		args := structs.TestRegisterRequest(t)
+		args.Service.Service = "api"
+		args.Check = &structs.HealthCheck{
+			Name:      "api",
+			Status:    api.HealthPassing,
+			ServiceID: args.Service.Service,
+		}
+		assert.Nil(t, msgpackrpc.CallWithCodec(codec, "Catalog.Register", &args, &out))
+
+		// Register a proxy for api
+		args = structs.TestRegisterRequestProxy(t)
+		args.Service.Service = "api-proxy"
+		args.Service.Proxy.DestinationServiceName = "api"
+		args.Check = &structs.HealthCheck{
+			Name:      "api-proxy",
+			Status:    api.HealthPassing,
+			ServiceID: args.Service.Service,
+		}
+		assert.Nil(t, msgpackrpc.CallWithCodec(codec, "Catalog.Register", &args, &out))
+
+		// Register a service "web"
+		args = structs.TestRegisterRequest(t)
+		args.Check = &structs.HealthCheck{
+			Name:      "web",
+			Status:    api.HealthPassing,
+			ServiceID: args.Service.Service,
+		}
+		assert.Nil(t, msgpackrpc.CallWithCodec(codec, "Catalog.Register", &args, &out))
+
+		// Register a proxy for web
+		args = structs.TestRegisterRequestProxy(t)
+		args.Check = &structs.HealthCheck{
+			Name:      "web-proxy",
+			Status:    api.HealthPassing,
+			ServiceID: args.Service.Service,
+		}
+		assert.Nil(t, msgpackrpc.CallWithCodec(codec, "Catalog.Register", &args, &out))
+
+		// Register a gateway for web
+		args = &structs.RegisterRequest{
+			Datacenter: "dc1",
+			Node:       "foo",
+			Address:    "127.0.0.1",
+			Service: &structs.NodeService{
+				Kind:    structs.ServiceKindTerminatingGateway,
+				Service: "gateway",
+				Port:    443,
+			},
+			Check: &structs.HealthCheck{
+				Name:      "gateway",
+				Status:    api.HealthPassing,
+				ServiceID: args.Service.Service,
+			},
+		}
+		assert.Nil(t, msgpackrpc.CallWithCodec(codec, "Catalog.Register", &args, &out))
+
+		entryArgs := &structs.ConfigEntryRequest{
+			Op:         structs.ConfigEntryUpsert,
+			Datacenter: "dc1",
+			Entry: &structs.TerminatingGatewayConfigEntry{
+				Kind: "terminating-gateway",
+				Name: "gateway",
+				Services: []structs.LinkedService{
+					{
+						Name: "web",
+					},
+				},
+			},
+		}
+		var entryResp bool
+		assert.Nil(t, msgpackrpc.CallWithCodec(codec, "ConfigEntry.Apply", &entryArgs, &entryResp))
+	}
+
+	retry.Run(t, func(r *retry.R) {
+		// List should return both the terminating-gateway and the connect-proxy associated with web
+		req := structs.ServiceSpecificRequest{
+			Connect:     true,
+			Datacenter:  "dc1",
+			ServiceName: "web",
+		}
+		var resp structs.IndexedServiceNodes
+		assert.Nil(r, msgpackrpc.CallWithCodec(codec, "Catalog.ServiceNodes", &req, &resp))
+		assert.Len(r, resp.ServiceNodes, 2)
+
+		// Check sidecar
+		assert.Equal(r, structs.ServiceKindConnectProxy, resp.ServiceNodes[0].ServiceKind)
+		assert.Equal(r, "foo", resp.ServiceNodes[0].Node)
+		assert.Equal(r, "web-proxy", resp.ServiceNodes[0].ServiceName)
+		assert.Equal(r, "web-proxy", resp.ServiceNodes[0].ServiceID)
+		assert.Equal(r, "web", resp.ServiceNodes[0].ServiceProxy.DestinationServiceName)
+		assert.Equal(r, 2222, resp.ServiceNodes[0].ServicePort)
+
+		// Check gateway
+		assert.Equal(r, structs.ServiceKindTerminatingGateway, resp.ServiceNodes[1].ServiceKind)
+		assert.Equal(r, "foo", resp.ServiceNodes[1].Node)
+		assert.Equal(r, "gateway", resp.ServiceNodes[1].ServiceName)
+		assert.Equal(r, "gateway", resp.ServiceNodes[1].ServiceID)
+		assert.Equal(r, 443, resp.ServiceNodes[1].ServicePort)
+	})
+}
+
 func TestCatalog_ListServiceNodes_ConnectDestination(t *testing.T) {
 	t.Parallel()
 
@@ -2168,7 +2226,6 @@ func TestCatalog_ListServiceNodes_ConnectDestinationNative(t *testing.T) {
 func TestCatalog_ListServiceNodes_ConnectProxy_ACL(t *testing.T) {
 	t.Parallel()
 
-	assert := assert.New(t)
 	dir1, s1 := testServerWithConfig(t, func(c *Config) {
 		c.ACLDatacenter = "dc1"
 		c.ACLsEnabled = true
@@ -2193,12 +2250,13 @@ func TestCatalog_ListServiceNodes_ConnectProxy_ACL(t *testing.T) {
 service "foo" {
 	policy = "write"
 }
+node "" { policy = "read" }
 `,
 		},
 		WriteRequest: structs.WriteRequest{Token: "root"},
 	}
 	var token string
-	assert.Nil(msgpackrpc.CallWithCodec(codec, "ACL.Apply", &arg, &token))
+	require.NoError(t, msgpackrpc.CallWithCodec(codec, "ACL.Apply", &arg, &token))
 
 	{
 		// Register a proxy
@@ -2207,21 +2265,21 @@ service "foo" {
 		args.Service.Proxy.DestinationServiceName = "bar"
 		args.WriteRequest.Token = "root"
 		var out struct{}
-		assert.Nil(msgpackrpc.CallWithCodec(codec, "Catalog.Register", &args, &out))
+		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.Register", &args, &out))
 
 		// Register a proxy
 		args = structs.TestRegisterRequestProxy(t)
 		args.Service.Service = "foo-proxy"
 		args.Service.Proxy.DestinationServiceName = "foo"
 		args.WriteRequest.Token = "root"
-		assert.Nil(msgpackrpc.CallWithCodec(codec, "Catalog.Register", &args, &out))
+		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.Register", &args, &out))
 
 		// Register a proxy
 		args = structs.TestRegisterRequestProxy(t)
 		args.Service.Service = "another-proxy"
 		args.Service.Proxy.DestinationServiceName = "foo"
 		args.WriteRequest.Token = "root"
-		assert.Nil(msgpackrpc.CallWithCodec(codec, "Catalog.Register", &args, &out))
+		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.Register", &args, &out))
 	}
 
 	// List w/ token. This should disallow because we don't have permission
@@ -2233,8 +2291,8 @@ service "foo" {
 		QueryOptions: structs.QueryOptions{Token: token},
 	}
 	var resp structs.IndexedServiceNodes
-	assert.Nil(msgpackrpc.CallWithCodec(codec, "Catalog.ServiceNodes", &req, &resp))
-	assert.Len(resp.ServiceNodes, 0)
+	require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.ServiceNodes", &req, &resp))
+	require.Len(t, resp.ServiceNodes, 0)
 
 	// List w/ token. This should work since we're requesting "foo", but should
 	// also only contain the proxies with names that adhere to our ACL.
@@ -2244,10 +2302,11 @@ service "foo" {
 		ServiceName:  "foo",
 		QueryOptions: structs.QueryOptions{Token: token},
 	}
-	assert.Nil(msgpackrpc.CallWithCodec(codec, "Catalog.ServiceNodes", &req, &resp))
-	assert.Len(resp.ServiceNodes, 1)
+	resp = structs.IndexedServiceNodes{}
+	require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.ServiceNodes", &req, &resp))
+	require.Len(t, resp.ServiceNodes, 1)
 	v := resp.ServiceNodes[0]
-	assert.Equal("foo-proxy", v.ServiceName)
+	require.Equal(t, "foo-proxy", v.ServiceName)
 }
 
 func TestCatalog_ListServiceNodes_ConnectNative(t *testing.T) {
@@ -2324,7 +2383,7 @@ func TestCatalog_NodeServices(t *testing.T) {
 		t.Fatalf("bad: %v", out)
 	}
 	services := out.NodeServices.Services
-	if !lib.StrContains(services["db"].Tags, "primary") || services["db"].Port != 5000 {
+	if !stringslice.Contains(services["db"].Tags, "primary") || services["db"].Port != 5000 {
 		t.Fatalf("bad: %v", out)
 	}
 	if len(services["web"].Tags) != 0 || services["web"].Port != 80 {
@@ -2447,11 +2506,10 @@ func testACLFilterServer(t *testing.T) (dir, token string, srv *Server, codec rp
 		c.ACLsEnabled = true
 		c.ACLMasterToken = "root"
 		c.ACLDefaultPolicy = "deny"
-		c.ACLEnforceVersion8 = false
 	})
 
 	codec = rpcClient(t, srv)
-	testrpc.WaitForLeader(t, srv.RPC, "dc1")
+	testrpc.WaitForTestAgent(t, srv.RPC, "dc1", testrpc.WithToken("root"))
 
 	// Create a new token
 	arg := structs.ACLRequest{
@@ -2463,6 +2521,9 @@ func testACLFilterServer(t *testing.T) (dir, token string, srv *Server, codec rp
 			Rules: `
 service "foo" {
 	policy = "write"
+}
+node "" {
+	policy = "read"
 }
 `,
 		},
@@ -2521,7 +2582,7 @@ func TestCatalog_ListServices_FilterACL(t *testing.T) {
 	defer os.RemoveAll(dir)
 	defer srv.Shutdown()
 	defer codec.Close()
-	testrpc.WaitForTestAgent(t, srv.RPC, "dc1")
+	testrpc.WaitForTestAgent(t, srv.RPC, "dc1", testrpc.WithToken("root"))
 
 	opt := structs.DCSpecificRequest{
 		Datacenter:   "dc1",
@@ -2596,30 +2657,20 @@ func TestCatalog_NodeServices_ACLDeny(t *testing.T) {
 		c.ACLsEnabled = true
 		c.ACLMasterToken = "root"
 		c.ACLDefaultPolicy = "deny"
-		c.ACLEnforceVersion8 = false
 	})
 	defer os.RemoveAll(dir1)
 	defer s1.Shutdown()
 	codec := rpcClient(t, s1)
 	defer codec.Close()
 
-	testrpc.WaitForTestAgent(t, s1.RPC, "dc1")
+	testrpc.WaitForTestAgent(t, s1.RPC, "dc1", testrpc.WithToken("root"))
 
-	// Prior to version 8, the node policy should be ignored.
+	// The node policy should not be ignored.
 	args := structs.NodeSpecificRequest{
 		Datacenter: "dc1",
 		Node:       s1.config.NodeName,
 	}
 	reply := structs.IndexedNodeServices{}
-	if err := msgpackrpc.CallWithCodec(codec, "Catalog.NodeServices", &args, &reply); err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if reply.NodeServices == nil {
-		t.Fatalf("should not be nil")
-	}
-
-	// Now turn on version 8 enforcement and try again.
-	s1.config.ACLEnforceVersion8 = true
 	if err := msgpackrpc.CallWithCodec(codec, "Catalog.NodeServices", &args, &reply); err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -2672,28 +2723,21 @@ func TestCatalog_NodeServices_FilterACL(t *testing.T) {
 	defer os.RemoveAll(dir)
 	defer srv.Shutdown()
 	defer codec.Close()
-	testrpc.WaitForTestAgent(t, srv.RPC, "dc1")
+	testrpc.WaitForTestAgent(t, srv.RPC, "dc1", testrpc.WithToken("root"))
 
 	opt := structs.NodeSpecificRequest{
 		Datacenter:   "dc1",
 		Node:         srv.config.NodeName,
 		QueryOptions: structs.QueryOptions{Token: token},
 	}
-	reply := structs.IndexedNodeServices{}
-	if err := msgpackrpc.CallWithCodec(codec, "Catalog.NodeServices", &opt, &reply); err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	found := false
-	for _, svc := range reply.NodeServices.Services {
-		if svc.ID == "bar" {
-			t.Fatalf("bad: %#v", reply.NodeServices.Services)
-		}
-		if svc.ID == "foo" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("bad: %#v", reply.NodeServices)
-	}
+
+	var reply structs.IndexedNodeServices
+	require.NoError(t, msgpackrpc.CallWithCodec(codec, "Catalog.NodeServices", &opt, &reply))
+
+	require.NotNil(t, reply.NodeServices)
+	require.Len(t, reply.NodeServices.Services, 1)
+
+	svc, ok := reply.NodeServices.Services["foo"]
+	require.True(t, ok)
+	require.Equal(t, "foo", svc.ID)
 }

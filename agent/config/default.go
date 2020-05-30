@@ -10,18 +10,6 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-func DefaultRPCProtocol() (int, error) {
-	src := DefaultSource()
-	c, err := Parse(src.Data, src.Format)
-	if err != nil {
-		return 0, fmt.Errorf("Error parsing default config: %s", err)
-	}
-	if c.RPCProtocol == nil {
-		return 0, fmt.Errorf("No default RPC protocol set")
-	}
-	return *c.RPCProtocol, nil
-}
-
 // DefaultSource is the default agent configuration.
 // This needs to be merged first in the head.
 // todo(fs): The values are sourced from multiple sources.
@@ -43,7 +31,6 @@ func DefaultSource() Source {
 		Data: `
 		acl_default_policy = "allow"
 		acl_down_policy = "extend-cache"
-		acl_enforce_version_8 = true
 		acl_ttl = "30s"
 		acl = {
 			policy_ttl = "30s"
@@ -55,6 +42,7 @@ func DefaultSource() Source {
 		check_update_interval = "5m"
 		client_addr = "127.0.0.1"
 		datacenter = "` + consul.DefaultDC + `"
+		default_query_time = "300s"
 		disable_coordinates = false
 		disable_host_node_id = true
 		disable_remote_exec = true
@@ -62,7 +50,9 @@ func DefaultSource() Source {
 		encrypt_verify_incoming = true
 		encrypt_verify_outgoing = true
 		log_level = "INFO"
-		protocol =  2
+		max_query_time = "600s"
+		primary_gateways_interval = "30s"
+		protocol = ` + strconv.Itoa(consul.DefaultRPCProtocol) + `
 		retry_interval = "30s"
 		retry_interval_wan = "30s"
 		server = false
@@ -101,9 +91,14 @@ func DefaultSource() Source {
 			recursor_timeout = "2s"
 		}
 		limits = {
+			http_max_conns_per_client = 200
+			https_handshake_timeout = "5s"
+			rpc_handshake_timeout = "5s"
 			rpc_rate = -1
 			rpc_max_burst = 1000
+			rpc_max_conns_per_client = 100
 			kv_max_value_size = ` + strconv.FormatInt(raft.SuggestedMaxDataSize, 10) + `
+			txn_max_req_len = ` + strconv.FormatInt(raft.SuggestedMaxDataSize, 10) + `
 		}
 		performance = {
 			leave_drain_time = "5s"

@@ -21,7 +21,16 @@ export default Store.extend({
   self: function(modelName, token) {
     // TODO: no normalization, type it properly for the moment
     const adapter = this.adapterFor(modelName);
-    return adapter.self(this, { modelName: modelName }, token.secret, token);
+    const serializer = this.serializerFor(modelName);
+    const modelClass = { modelName: modelName };
+    // self is the only custom store method that goes through the serializer for the moment
+    // this means it will have its meta data set correctly
+    // if other methods need meta adding, then this should be carried over to
+    // other methods. Ideally this would have been done from the outset
+    // TODO: Carry this over to the other methods ^
+    return adapter
+      .self(this, modelClass, token.secret, token)
+      .then(payload => serializer.normalizeResponse(this, modelClass, payload, token, 'self'));
   },
   //
   // TODO: This one is only for nodes, should fail nicely if you call it
@@ -30,5 +39,22 @@ export default Store.extend({
     // TODO: no normalization, type it properly for the moment
     const adapter = this.adapterFor(modelName);
     return adapter.queryLeader(this, { modelName: modelName }, null, query);
+  },
+  // TODO: This one is only for nspaces and OIDC, should fail nicely if you call it
+  // for anything other than nspaces/OIDC for good DX
+  authorize: function(modelName, query = {}) {
+    const adapter = this.adapterFor(modelName);
+    const serializer = this.serializerFor(modelName);
+    const modelClass = { modelName: modelName };
+    return adapter
+      .authorize(this, modelClass, null, query)
+      .then(payload =>
+        serializer.normalizeResponse(this, modelClass, payload, undefined, 'authorize')
+      );
+  },
+  logout: function(modelName, query = {}) {
+    const adapter = this.adapterFor(modelName);
+    const modelClass = { modelName: modelName };
+    return adapter.logout(this, modelClass, query.id, query);
   },
 });

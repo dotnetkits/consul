@@ -19,17 +19,17 @@ func (s *Store) txnKVS(tx *memdb.Txn, idx uint64, op *structs.TxnKVOp) (structs.
 		err = s.kvsSetTxn(tx, idx, entry, false)
 
 	case api.KVDelete:
-		err = s.kvsDeleteTxn(tx, idx, op.DirEnt.Key)
+		err = s.kvsDeleteTxn(tx, idx, op.DirEnt.Key, &op.DirEnt.EnterpriseMeta)
 
 	case api.KVDeleteCAS:
 		var ok bool
-		ok, err = s.kvsDeleteCASTxn(tx, idx, op.DirEnt.ModifyIndex, op.DirEnt.Key)
+		ok, err = s.kvsDeleteCASTxn(tx, idx, op.DirEnt.ModifyIndex, op.DirEnt.Key, &op.DirEnt.EnterpriseMeta)
 		if !ok && err == nil {
 			err = fmt.Errorf("failed to delete key %q, index is stale", op.DirEnt.Key)
 		}
 
 	case api.KVDeleteTree:
-		err = s.kvsDeleteTreeTxn(tx, idx, op.DirEnt.Key)
+		err = s.kvsDeleteTreeTxn(tx, idx, op.DirEnt.Key, &op.DirEnt.EnterpriseMeta)
 
 	case api.KVCAS:
 		var ok bool
@@ -56,14 +56,14 @@ func (s *Store) txnKVS(tx *memdb.Txn, idx uint64, op *structs.TxnKVOp) (structs.
 		}
 
 	case api.KVGet:
-		_, entry, err = s.kvsGetTxn(tx, nil, op.DirEnt.Key)
+		_, entry, err = s.kvsGetTxn(tx, nil, op.DirEnt.Key, &op.DirEnt.EnterpriseMeta)
 		if entry == nil && err == nil {
 			err = fmt.Errorf("key %q doesn't exist", op.DirEnt.Key)
 		}
 
 	case api.KVGetTree:
 		var entries structs.DirEntries
-		_, entries, err = s.kvsListTxn(tx, nil, op.DirEnt.Key)
+		_, entries, err = s.kvsListTxn(tx, nil, op.DirEnt.Key, &op.DirEnt.EnterpriseMeta)
 		if err == nil {
 			results := make(structs.TxnResults, 0, len(entries))
 			for _, e := range entries {
@@ -74,13 +74,13 @@ func (s *Store) txnKVS(tx *memdb.Txn, idx uint64, op *structs.TxnKVOp) (structs.
 		}
 
 	case api.KVCheckSession:
-		entry, err = s.kvsCheckSessionTxn(tx, op.DirEnt.Key, op.DirEnt.Session)
+		entry, err = s.kvsCheckSessionTxn(tx, op.DirEnt.Key, op.DirEnt.Session, &op.DirEnt.EnterpriseMeta)
 
 	case api.KVCheckIndex:
-		entry, err = s.kvsCheckIndexTxn(tx, op.DirEnt.Key, op.DirEnt.ModifyIndex)
+		entry, err = s.kvsCheckIndexTxn(tx, op.DirEnt.Key, op.DirEnt.ModifyIndex, &op.DirEnt.EnterpriseMeta)
 
 	case api.KVCheckNotExists:
-		_, entry, err = s.kvsGetTxn(tx, nil, op.DirEnt.Key)
+		_, entry, err = s.kvsGetTxn(tx, nil, op.DirEnt.Key, &op.DirEnt.EnterpriseMeta)
 		if entry != nil && err == nil {
 			err = fmt.Errorf("key %q exists", op.DirEnt.Key)
 		}
@@ -108,6 +108,23 @@ func (s *Store) txnKVS(tx *memdb.Txn, idx uint64, op *structs.TxnKVOp) (structs.
 	}
 
 	return nil, nil
+}
+
+// txnSession handles all Session-related operations.
+func (s *Store) txnSession(tx *memdb.Txn, idx uint64, op *structs.TxnSessionOp) error {
+	var err error
+
+	switch op.Verb {
+	case api.SessionDelete:
+		err = s.sessionDeleteWithSession(tx, &op.Session, idx)
+	default:
+		err = fmt.Errorf("unknown Session verb %q", op.Verb)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to delete session: %v", err)
+	}
+
+	return nil
 }
 
 // txnIntention handles all Intention-related operations.
@@ -193,61 +210,64 @@ func (s *Store) txnNode(tx *memdb.Txn, idx uint64, op *structs.TxnNodeOp) (struc
 
 // txnService handles all Service-related operations.
 func (s *Store) txnService(tx *memdb.Txn, idx uint64, op *structs.TxnServiceOp) (structs.TxnResults, error) {
-	var entry *structs.NodeService
-	var err error
-
 	switch op.Verb {
 	case api.ServiceGet:
-		entry, err = s.getNodeServiceTxn(tx, op.Node, op.Service.ID)
-		if entry == nil && err == nil {
-			err = fmt.Errorf("service %q on node %q doesn't exist", op.Service.ID, op.Node)
+		entry, err := s.getNodeServiceTxn(tx, op.Node, op.Service.ID, &op.Service.EnterpriseMeta)
+		switch {
+		case err != nil:
+			return nil, err
+		case entry == nil:
+			return nil, fmt.Errorf("service %q on node %q doesn't exist", op.Service.ID, op.Node)
+		default:
+			return structs.TxnResults{&structs.TxnResult{Service: entry}}, nil
 		}
 
 	case api.ServiceSet:
-		err = s.ensureServiceTxn(tx, idx, op.Node, &op.Service)
-		entry, err = s.getNodeServiceTxn(tx, op.Node, op.Service.ID)
+		if err := s.ensureServiceTxn(tx, idx, op.Node, &op.Service); err != nil {
+			return nil, err
+		}
+		entry, err := s.getNodeServiceTxn(tx, op.Node, op.Service.ID, &op.Service.EnterpriseMeta)
+		return newTxnResultFromNodeServiceEntry(entry), err
 
 	case api.ServiceCAS:
-		var ok bool
-		ok, err = s.ensureServiceCASTxn(tx, idx, op.Node, &op.Service)
-		if !ok && err == nil {
-			err = fmt.Errorf("failed to set service %q on node %q, index is stale", op.Service.ID, op.Node)
-			break
+		err := s.ensureServiceCASTxn(tx, idx, op.Node, &op.Service)
+		switch {
+		case err == errCASCompareFailed:
+			err := fmt.Errorf("failed to set service %q on node %q, index is stale", op.Service.ID, op.Node)
+			return nil, err
+		case err != nil:
+			return nil, err
 		}
-		entry, err = s.getNodeServiceTxn(tx, op.Node, op.Service.ID)
+
+		entry, err := s.getNodeServiceTxn(tx, op.Node, op.Service.ID, &op.Service.EnterpriseMeta)
+		return newTxnResultFromNodeServiceEntry(entry), err
 
 	case api.ServiceDelete:
-		err = s.deleteServiceTxn(tx, idx, op.Node, op.Service.ID)
+		err := s.deleteServiceTxn(tx, idx, op.Node, op.Service.ID, &op.Service.EnterpriseMeta)
+		return nil, err
 
 	case api.ServiceDeleteCAS:
-		var ok bool
-		ok, err = s.deleteServiceCASTxn(tx, idx, op.Service.ModifyIndex, op.Node, op.Service.ID)
+		ok, err := s.deleteServiceCASTxn(tx, idx, op.Service.ModifyIndex, op.Node, op.Service.ID, &op.Service.EnterpriseMeta)
 		if !ok && err == nil {
-			err = fmt.Errorf("failed to delete service %q on node %q, index is stale", op.Service.ID, op.Node)
+			return nil, fmt.Errorf("failed to delete service %q on node %q, index is stale", op.Service.ID, op.Node)
 		}
+		return nil, err
 
 	default:
-		err = fmt.Errorf("unknown Service verb %q", op.Verb)
+		return nil, fmt.Errorf("unknown Service verb %q", op.Verb)
 	}
-	if err != nil {
-		return nil, err
+}
+
+// newTxnResultFromNodeServiceEntry returns a TxnResults with a single result,
+// a copy of entry. The entry is copied to prevent modification of the state
+// store.
+func newTxnResultFromNodeServiceEntry(entry *structs.NodeService) structs.TxnResults {
+	if entry == nil {
+		return nil
 	}
-
-	// For a GET we keep the value, otherwise we clone and blank out the
-	// value (we have to clone so we don't modify the entry being used by
-	// the state store).
-	if entry != nil {
-		if op.Verb == api.ServiceGet {
-			result := structs.TxnResult{Service: entry}
-			return structs.TxnResults{&result}, nil
-		}
-
-		clone := *entry
-		result := structs.TxnResult{Service: &clone}
-		return structs.TxnResults{&result}, nil
-	}
-
-	return nil, nil
+	clone := *entry
+	result := structs.TxnResult{Service: &clone}
+	return structs.TxnResults{&result}
 }
 
 // txnCheck handles all Check-related operations.
@@ -257,7 +277,7 @@ func (s *Store) txnCheck(tx *memdb.Txn, idx uint64, op *structs.TxnCheckOp) (str
 
 	switch op.Verb {
 	case api.CheckGet:
-		_, entry, err = s.getNodeCheckTxn(tx, op.Check.Node, op.Check.CheckID)
+		_, entry, err = s.getNodeCheckTxn(tx, op.Check.Node, op.Check.CheckID, &op.Check.EnterpriseMeta)
 		if entry == nil && err == nil {
 			err = fmt.Errorf("check %q on node %q doesn't exist", op.Check.CheckID, op.Check.Node)
 		}
@@ -265,7 +285,7 @@ func (s *Store) txnCheck(tx *memdb.Txn, idx uint64, op *structs.TxnCheckOp) (str
 	case api.CheckSet:
 		err = s.ensureCheckTxn(tx, idx, &op.Check)
 		if err == nil {
-			_, entry, err = s.getNodeCheckTxn(tx, op.Check.Node, op.Check.CheckID)
+			_, entry, err = s.getNodeCheckTxn(tx, op.Check.Node, op.Check.CheckID, &op.Check.EnterpriseMeta)
 		}
 
 	case api.CheckCAS:
@@ -276,14 +296,14 @@ func (s *Store) txnCheck(tx *memdb.Txn, idx uint64, op *structs.TxnCheckOp) (str
 			err = fmt.Errorf("failed to set check %q on node %q, index is stale", entry.CheckID, entry.Node)
 			break
 		}
-		_, entry, err = s.getNodeCheckTxn(tx, op.Check.Node, op.Check.CheckID)
+		_, entry, err = s.getNodeCheckTxn(tx, op.Check.Node, op.Check.CheckID, &op.Check.EnterpriseMeta)
 
 	case api.CheckDelete:
-		err = s.deleteCheckTxn(tx, idx, op.Check.Node, op.Check.CheckID)
+		err = s.deleteCheckTxn(tx, idx, op.Check.Node, op.Check.CheckID, &op.Check.EnterpriseMeta)
 
 	case api.CheckDeleteCAS:
 		var ok bool
-		ok, err = s.deleteCheckCASTxn(tx, idx, op.Check.ModifyIndex, op.Check.Node, op.Check.CheckID)
+		ok, err = s.deleteCheckCASTxn(tx, idx, op.Check.ModifyIndex, op.Check.Node, op.Check.CheckID, &op.Check.EnterpriseMeta)
 		if !ok && err == nil {
 			err = fmt.Errorf("failed to delete check %q on node %q, index is stale", op.Check.CheckID, op.Check.Node)
 		}
@@ -332,6 +352,8 @@ func (s *Store) txnDispatch(tx *memdb.Txn, idx uint64, ops structs.TxnOps) (stru
 			ret, err = s.txnService(tx, idx, op.Service)
 		case op.Check != nil:
 			ret, err = s.txnCheck(tx, idx, op.Check)
+		case op.Session != nil:
+			err = s.txnSession(tx, idx, op.Session)
 		default:
 			err = fmt.Errorf("no operation specified")
 		}

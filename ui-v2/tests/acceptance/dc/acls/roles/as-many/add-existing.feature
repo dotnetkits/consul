@@ -21,10 +21,10 @@ Feature: dc / acls / roles / as many / add existing: Add existing
       token: key
     ---
     Then the url should be /datacenter/acls/tokens/key
-    And I click "#roles .ember-power-select-trigger"
+    And I click "form > #roles .ember-power-select-trigger"
     And I click ".ember-power-select-option:first-child"
     And I see 1 role model on the roles component
-    And I click "#roles .ember-power-select-trigger"
+    And I click "form > #roles .ember-power-select-trigger"
     And I click ".ember-power-select-option:nth-child(1)"
     And I see 2 role models on the roles component
     Then I fill in with yaml
@@ -32,14 +32,16 @@ Feature: dc / acls / roles / as many / add existing: Add existing
       Description: The Description
     ---
     And I submit
-    Then a PUT request is made to "/v1/acl/token/key?dc=datacenter" with the body from yaml
+    Then a PUT request was made to "/v1/acl/token/key?dc=datacenter" from yaml
     ---
-      Description: The Description
-      Roles:
-      - ID: role-1
-        Name: Role 1
-      - ID: role-2
-        Name: Role 2
+      body:
+        Namespace: @namespace
+        Description: The Description
+        Roles:
+        - ID: role-1
+          Name: Role 1
+        - ID: role-2
+          Name: Role 2
     ---
     Then the url should be /datacenter/acls/tokens
     And "[data-notification]" has the "notification-update" class

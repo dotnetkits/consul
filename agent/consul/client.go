@@ -3,7 +3,6 @@ package consul
 import (
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"strconv"
 	"sync"
@@ -15,7 +14,9 @@ import (
 	"github.com/hashicorp/consul/agent/router"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/lib"
+	"github.com/hashicorp/consul/logging"
 	"github.com/hashicorp/consul/tlsutil"
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/serf/serf"
 	"golang.org/x/time/rate"
 )
@@ -72,7 +73,7 @@ type Client struct {
 	eventCh chan serf.Event
 
 	// Logger uses the provided LogOutput
-	logger *log.Logger
+	logger hclog.InterceptLogger
 
 	// serf is the Serf cluster maintained inside the DC
 	// which contains all the DC nodes
@@ -100,7 +101,7 @@ func NewClient(config *Config) (*Client, error) {
 	return NewClientLogger(config, nil, c)
 }
 
-func NewClientLogger(config *Config, logger *log.Logger, tlsConfigurator *tlsutil.Configurator) (*Client, error) {
+func NewClientLogger(config *Config, logger hclog.InterceptLogger, tlsConfigurator *tlsutil.Configurator) (*Client, error) {
 	// Check the protocol version
 	if err := config.CheckProtocolVersion(); err != nil {
 		return nil, err
@@ -123,16 +124,21 @@ func NewClientLogger(config *Config, logger *log.Logger, tlsConfigurator *tlsuti
 
 	// Create a logger
 	if logger == nil {
-		logger = log.New(config.LogOutput, "", log.LstdFlags)
+		logger = hclog.NewInterceptLogger(&hclog.LoggerOptions{
+			Level:  hclog.Debug,
+			Output: config.LogOutput,
+		})
 	}
 
 	connPool := &pool.ConnPool{
+		Server:          false,
 		SrcAddr:         config.RPCSrcAddr,
 		LogOutput:       config.LogOutput,
 		MaxTime:         clientRPCConnMaxIdle,
 		MaxStreams:      clientMaxStreams,
 		TLSConfigurator: tlsConfigurator,
 		ForceTLS:        config.VerifyOutgoing,
+		Datacenter:      config.Datacenter,
 	}
 
 	// Create client
@@ -140,7 +146,7 @@ func NewClientLogger(config *Config, logger *log.Logger, tlsConfigurator *tlsuti
 		config:          config,
 		connPool:        connPool,
 		eventCh:         make(chan serf.Event, serfEventBacklog),
-		logger:          logger,
+		logger:          logger.NamedIntercept(logging.ConsulClient),
 		shutdownCh:      make(chan struct{}),
 		tlsConfigurator: tlsConfigurator,
 	}
@@ -154,12 +160,12 @@ func NewClientLogger(config *Config, logger *log.Logger, tlsConfigurator *tlsuti
 
 	c.useNewACLs = 0
 	aclConfig := ACLResolverConfig{
-		Config:           config,
-		Delegate:         c,
-		Logger:           logger,
-		AutoDisable:      true,
-		CacheConfig:      clientACLCacheConfig,
-		EnterpriseConfig: newEnterpriseACLConfig(logger),
+		Config:      config,
+		Delegate:    c,
+		Logger:      c.logger,
+		AutoDisable: true,
+		CacheConfig: clientACLCacheConfig,
+		ACLConfig:   newACLConfig(c.logger),
 	}
 	var err error
 	if c.acls, err = NewACLResolver(&aclConfig); err != nil {
@@ -180,7 +186,7 @@ func NewClientLogger(config *Config, logger *log.Logger, tlsConfigurator *tlsuti
 	}
 
 	// Start maintenance task for servers
-	c.routers = router.New(c.logger, c.shutdownCh, c.serf, c.connPool)
+	c.routers = router.New(c.logger, c.shutdownCh, c.serf, c.connPool, "")
 	go c.routers.Start()
 
 	// Start LAN event handlers after the router is complete since the event
@@ -197,7 +203,7 @@ func NewClientLogger(config *Config, logger *log.Logger, tlsConfigurator *tlsuti
 
 // Shutdown is used to shutdown the client
 func (c *Client) Shutdown() error {
-	c.logger.Printf("[INFO] consul: shutting down client")
+	c.logger.Info("shutting down client")
 	c.shutdownLock.Lock()
 	defer c.shutdownLock.Unlock()
 
@@ -214,17 +220,20 @@ func (c *Client) Shutdown() error {
 
 	// Close the connection pool
 	c.connPool.Shutdown()
+
+	c.acls.Close()
+
 	return nil
 }
 
 // Leave is used to prepare for a graceful shutdown
 func (c *Client) Leave() error {
-	c.logger.Printf("[INFO] consul: client starting leave")
+	c.logger.Info("client starting leave")
 
 	// Leave the LAN pool
 	if c.serf != nil {
 		if err := c.serf.Leave(); err != nil {
-			c.logger.Printf("[ERR] consul: Failed to leave LAN Serf cluster: %v", err)
+			c.logger.Error("Failed to leave LAN Serf cluster", "error", err)
 		}
 	}
 	return nil
@@ -275,11 +284,6 @@ func (c *Client) KeyManagerLAN() *serf.KeyManager {
 	return c.serf.KeyManager()
 }
 
-// Encrypted determines if gossip is encrypted
-func (c *Client) Encrypted() bool {
-	return c.serf.EncryptionEnabled()
-}
-
 // RPC is used to forward an RPC call to a consul server, or fail if no servers
 func (c *Client) RPC(method string, args interface{}, reply interface{}) error {
 	// This is subtle but we start measuring the time on the client side
@@ -304,13 +308,17 @@ TRY:
 	}
 
 	// Make the request.
-	rpcErr := c.connPool.RPC(c.config.Datacenter, server.Addr, server.Version, method, server.UseTLS, args, reply)
+	rpcErr := c.connPool.RPC(c.config.Datacenter, server.ShortName, server.Addr, server.Version, method, args, reply)
 	if rpcErr == nil {
 		return nil
 	}
 
 	// Move off to another server, and see if we can retry.
-	c.logger.Printf("[ERR] consul: %q RPC failed to server %s: %v", method, server.Addr, rpcErr)
+	c.logger.Error("RPC failed to server",
+		"method", method,
+		"server", server.Addr,
+		"error", rpcErr,
+	)
 	metrics.IncrCounterWithLabels([]string{"client", "rpc", "failed"}, 1, []metrics.Label{{Name: "server", Value: server.Name}})
 	c.routers.NotifyFailedServer(server)
 	if retry := canRetry(args, rpcErr); !retry {
@@ -348,13 +356,13 @@ func (c *Client) SnapshotRPC(args *structs.SnapshotRequest, in io.Reader, out io
 
 	// Request the operation.
 	var reply structs.SnapshotResponse
-	snap, err := SnapshotRPC(c.connPool, c.config.Datacenter, server.Addr, server.UseTLS, args, in, &reply)
+	snap, err := SnapshotRPC(c.connPool, c.config.Datacenter, server.ShortName, server.Addr, server.UseTLS, args, in, &reply)
 	if err != nil {
 		return err
 	}
 	defer func() {
 		if err := snap.Close(); err != nil {
-			c.logger.Printf("[WARN] consul: Failed closing snapshot stream: %v", err)
+			c.logger.Error("Failed closing snapshot stream", "error", err)
 		}
 	}()
 

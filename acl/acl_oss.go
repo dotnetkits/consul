@@ -2,5 +2,10 @@
 
 package acl
 
-// EnterpriseACLConfig stub
-type EnterpriseACLConfig struct{}
+type EnterpriseConfig struct {
+	// no fields in OSS
+}
+
+func (_ *EnterpriseConfig) Close() {
+	// do nothing
+}

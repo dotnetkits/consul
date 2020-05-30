@@ -161,7 +161,7 @@ func isPolicyValid(policy string, allowList bool) bool {
 	return true
 }
 
-func (pr *PolicyRules) Validate(conf *EnterpriseACLConfig) error {
+func (pr *PolicyRules) Validate(conf *Config) error {
 	// Validate the acl policy - this one is allowed to be empty
 	if pr.ACL != "" && !isPolicyValid(pr.ACL, false) {
 		return fmt.Errorf("Invalid acl policy: %#v", pr.ACL)
@@ -288,11 +288,10 @@ func (pr *PolicyRules) Validate(conf *EnterpriseACLConfig) error {
 	return nil
 }
 
-func parseCurrent(rules string, conf *EnterpriseACLConfig) (*Policy, error) {
-	p := &Policy{}
-
-	if err := hcl.Decode(p, rules); err != nil {
-		return nil, fmt.Errorf("Failed to parse ACL rules: %v", err)
+func parseCurrent(rules string, conf *Config, meta *EnterprisePolicyMeta) (*Policy, error) {
+	p, err := decodeRules(rules, conf, meta)
+	if err != nil {
+		return nil, err
 	}
 
 	if err := p.PolicyRules.Validate(conf); err != nil {
@@ -300,13 +299,13 @@ func parseCurrent(rules string, conf *EnterpriseACLConfig) (*Policy, error) {
 	}
 
 	if err := p.EnterprisePolicyRules.Validate(conf); err != nil {
-		return nil, fmt.Errorf("Invalidate enterprise rules: %v", err)
+		return nil, err
 	}
 
 	return p, nil
 }
 
-func parseLegacy(rules string, conf *EnterpriseACLConfig) (*Policy, error) {
+func parseLegacy(rules string, conf *Config) (*Policy, error) {
 	p := &Policy{}
 
 	type LegacyPolicy struct {
@@ -423,7 +422,7 @@ func parseLegacy(rules string, conf *EnterpriseACLConfig) (*Policy, error) {
 // NewPolicyFromSource is used to parse the specified ACL rules into an
 // intermediary set of policies, before being compiled into
 // the ACL
-func NewPolicyFromSource(id string, revision uint64, rules string, syntax SyntaxVersion, conf *EnterpriseACLConfig) (*Policy, error) {
+func NewPolicyFromSource(id string, revision uint64, rules string, syntax SyntaxVersion, conf *Config, meta *EnterprisePolicyMeta) (*Policy, error) {
 	if rules == "" {
 		// Hot path for empty source
 		return &Policy{ID: id, Revision: revision}, nil
@@ -435,7 +434,7 @@ func NewPolicyFromSource(id string, revision uint64, rules string, syntax Syntax
 	case SyntaxLegacy:
 		policy, err = parseLegacy(rules, conf)
 	case SyntaxCurrent:
-		policy, err = parseCurrent(rules, conf)
+		policy, err = parseCurrent(rules, conf, meta)
 	default:
 		return nil, fmt.Errorf("Invalid rules version: %d", syntax)
 	}

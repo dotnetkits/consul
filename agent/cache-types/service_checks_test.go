@@ -2,6 +2,9 @@ package cachetype
 
 import (
 	"fmt"
+	"testing"
+	"time"
+
 	"github.com/hashicorp/consul/agent/cache"
 	"github.com/hashicorp/consul/agent/checks"
 	"github.com/hashicorp/consul/agent/local"
@@ -10,8 +13,6 @@ import (
 	"github.com/hashicorp/consul/types"
 	"github.com/hashicorp/go-memdb"
 	"github.com/stretchr/testify/require"
-	"testing"
-	"time"
 )
 
 func TestServiceHTTPChecks_Fetch(t *testing.T) {
@@ -179,7 +180,7 @@ func newMockAgent() *mockAgent {
 	return &m
 }
 
-func (m *mockAgent) ServiceHTTPBasedChecks(id string) []structs.CheckType {
+func (m *mockAgent) ServiceHTTPBasedChecks(id structs.ServiceID) []structs.CheckType {
 	return m.checks
 }
 
@@ -187,8 +188,8 @@ func (m *mockAgent) LocalState() *local.State {
 	return m.state
 }
 
-func (m *mockAgent) LocalBlockingQuery(alwaysBlock bool, hash string, wait time.Duration,
-	fn func(ws memdb.WatchSet) (string, interface{}, error)) (string, interface{}, error) {
+func (m *mockAgent) LocalBlockingQuery(_ bool, _ string, _ time.Duration,
+	_ func(ws memdb.WatchSet) (string, interface{}, error)) (string, interface{}, error) {
 
 	hash, err := hashChecks(m.checks)
 	if err != nil {

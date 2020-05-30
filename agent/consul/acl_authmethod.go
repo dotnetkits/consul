@@ -7,8 +7,9 @@ import (
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/go-bexpr"
 
-	// register this as a builtin auth method
+	// register these as a builtin auth method
 	_ "github.com/hashicorp/consul/agent/consul/authmethod/kubeauth"
+	_ "github.com/hashicorp/consul/agent/consul/authmethod/ssoauth"
 )
 
 type authMethodValidatorEntry struct {
@@ -21,68 +22,18 @@ type authMethodValidatorEntry struct {
 // then the cached version is returned, otherwise a new validator is created
 // and cached.
 func (s *Server) loadAuthMethodValidator(idx uint64, method *structs.ACLAuthMethod) (authmethod.Validator, error) {
-	if prevIdx, v, ok := s.getCachedAuthMethodValidator(method.Name); ok && idx <= prevIdx {
+	if prevIdx, v, ok := s.aclAuthMethodValidators.GetValidator(method); ok && idx <= prevIdx {
 		return v, nil
 	}
 
-	v, err := authmethod.NewValidator(method)
+	v, err := authmethod.NewValidator(s.logger, method)
 	if err != nil {
 		return nil, fmt.Errorf("auth method validator for %q could not be initialized: %v", method.Name, err)
 	}
 
-	v = s.getOrReplaceAuthMethodValidator(method.Name, idx, v)
+	v = s.aclAuthMethodValidators.PutValidatorIfNewer(method, v, idx)
 
 	return v, nil
-}
-
-// getCachedAuthMethodValidator returns an AuthMethodValidator for
-// the given name exclusively from the cache. If one is not found in the cache
-// nil is returned.
-func (s *Server) getCachedAuthMethodValidator(name string) (uint64, authmethod.Validator, bool) {
-	s.aclAuthMethodValidatorLock.RLock()
-	defer s.aclAuthMethodValidatorLock.RUnlock()
-
-	if s.aclAuthMethodValidators != nil {
-		v, ok := s.aclAuthMethodValidators[name]
-		if ok {
-			return v.ModifyIndex, v.Validator, true
-		}
-	}
-	return 0, nil, false
-}
-
-// getOrReplaceAuthMethodValidator updates the cached validator with the
-// provided one UNLESS it has been updated by another goroutine in which case
-// the updated one is returned.
-func (s *Server) getOrReplaceAuthMethodValidator(name string, idx uint64, v authmethod.Validator) authmethod.Validator {
-	s.aclAuthMethodValidatorLock.Lock()
-	defer s.aclAuthMethodValidatorLock.Unlock()
-
-	if s.aclAuthMethodValidators == nil {
-		s.aclAuthMethodValidators = make(map[string]*authMethodValidatorEntry)
-	}
-
-	prev, ok := s.aclAuthMethodValidators[name]
-	if ok {
-		if prev.ModifyIndex >= idx {
-			return prev.Validator
-		}
-	}
-
-	s.logger.Printf("[DEBUG] acl: updating cached auth method validator for %q", name)
-
-	s.aclAuthMethodValidators[name] = &authMethodValidatorEntry{
-		Validator:   v,
-		ModifyIndex: idx,
-	}
-	return v
-}
-
-// purgeAuthMethodValidators resets the cache of validators.
-func (s *Server) purgeAuthMethodValidators() {
-	s.aclAuthMethodValidatorLock.Lock()
-	s.aclAuthMethodValidators = make(map[string]*authMethodValidatorEntry)
-	s.aclAuthMethodValidatorLock.Unlock()
 }
 
 // evaluateRoleBindings evaluates all current binding rules associated with the
@@ -92,23 +43,22 @@ func (s *Server) purgeAuthMethodValidators() {
 // A list of role links and service identities are returned.
 func (s *Server) evaluateRoleBindings(
 	validator authmethod.Validator,
-	verifiedFields map[string]string,
+	verifiedIdentity *authmethod.Identity,
+	methodMeta *structs.EnterpriseMeta,
+	targetMeta *structs.EnterpriseMeta,
 ) ([]*structs.ACLServiceIdentity, []structs.ACLTokenRoleLink, error) {
 	// Only fetch rules that are relevant for this method.
-	_, rules, err := s.fsm.State().ACLBindingRuleList(nil, validator.Name())
+	_, rules, err := s.fsm.State().ACLBindingRuleList(nil, validator.Name(), methodMeta)
 	if err != nil {
 		return nil, nil, err
 	} else if len(rules) == 0 {
 		return nil, nil, nil
 	}
 
-	// Convert the fields into something suitable for go-bexpr.
-	selectableVars := validator.MakeFieldMapSelectable(verifiedFields)
-
 	// Find all binding rules that match the provided fields.
 	var matchingRules []*structs.ACLBindingRule
 	for _, rule := range rules {
-		if doesBindingRuleMatch(rule, selectableVars) {
+		if doesSelectorMatch(rule.Selector, verifiedIdentity.SelectableFields) {
 			matchingRules = append(matchingRules, rule)
 		}
 	}
@@ -122,7 +72,7 @@ func (s *Server) evaluateRoleBindings(
 		serviceIdentities []*structs.ACLServiceIdentity
 	)
 	for _, rule := range matchingRules {
-		bindName, valid, err := computeBindingRuleBindName(rule.BindType, rule.BindName, verifiedFields)
+		bindName, valid, err := computeBindingRuleBindName(rule.BindType, rule.BindName, verifiedIdentity.ProjectedVars)
 		if err != nil {
 			return nil, nil, fmt.Errorf("cannot compute %q bind name for bind target: %v", rule.BindType, err)
 		} else if !valid {
@@ -136,7 +86,7 @@ func (s *Server) evaluateRoleBindings(
 			})
 
 		case structs.BindingRuleBindTypeRole:
-			_, role, err := s.fsm.State().ACLRoleGetByName(nil, bindName)
+			_, role, err := s.fsm.State().ACLRoleGetByName(nil, bindName, targetMeta)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -155,14 +105,13 @@ func (s *Server) evaluateRoleBindings(
 	return serviceIdentities, roleLinks, nil
 }
 
-// doesBindingRuleMatch checks that a single binding rule matches the provided
-// vars.
-func doesBindingRuleMatch(rule *structs.ACLBindingRule, selectableVars interface{}) bool {
-	if rule.Selector == "" {
+// doesSelectorMatch checks that a single selector matches the provided vars.
+func doesSelectorMatch(selector string, selectableVars interface{}) bool {
+	if selector == "" {
 		return true // catch-all
 	}
 
-	eval, err := bexpr.CreateEvaluatorForType(rule.Selector, nil, selectableVars)
+	eval, err := bexpr.CreateEvaluatorForType(selector, nil, selectableVars)
 	if err != nil {
 		return false // fails to match if selector is invalid
 	}

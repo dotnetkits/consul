@@ -1,21 +1,23 @@
 export default function(scenario, assert, pauseUntil, find, currentURL, clipboard) {
   scenario
     .then('pause until I see the text "$text" in "$selector"', function(text, selector) {
-      return pauseUntil(function(resolve) {
+      return pauseUntil(function(resolve, reject, retry) {
         const $el = find(selector);
         if ($el) {
           const hasText = $el.textContent.indexOf(text) !== -1;
           if (hasText) {
-            assert.ok(hasText, `Expected to see "${text}" in "${selector}"`);
-            resolve();
+            return resolve();
           }
+          return reject();
         }
-      });
+        return retry();
+      }, `Expected to see "${text}" in "${selector}"`);
     })
     .then(['I see the text "$text" in "$selector"'], function(text, selector) {
+      const textContent = find(selector).textContent;
       assert.ok(
-        find(selector).textContent.indexOf(text) !== -1,
-        `Expected to see "${text}" in "${selector}"`
+        textContent.indexOf(text) !== -1,
+        `Expected to see "${text}" in "${selector}", was "${textContent}"`
       );
     })
     .then(['I copied "$text"'], function(text) {
@@ -38,6 +40,9 @@ export default function(scenario, assert, pauseUntil, find, currentURL, clipboar
       assert
         .dom(document.querySelector(selector))
         .hasClass(cls, `Expected [class] to contain ${cls} on ${selector}`);
+    })
+    .then([`I don't see the "$selector" element`], function(selector) {
+      assert.equal(document.querySelector(selector), null, `Expected not to see ${selector}`);
     })
     .then(['"$selector" doesn\'t have the "$class" class'], function(selector, cls) {
       assert.ok(
@@ -65,5 +70,8 @@ export default function(scenario, assert, pauseUntil, find, currentURL, clipboar
       }
       const current = currentURL() || '';
       assert.equal(current, url, `Expected the url to be ${url} was ${current}`);
+    })
+    .then(['the title should be "$title"'], function(title) {
+      assert.equal(document.title, title, `Expected the document.title to equal "${title}"`);
     });
 }

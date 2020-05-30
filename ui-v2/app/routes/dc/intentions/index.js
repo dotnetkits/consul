@@ -7,6 +7,9 @@ import WithIntentionActions from 'consul-ui/mixins/intention/with-actions';
 export default Route.extend(WithIntentionActions, {
   repo: service('repository/intention'),
   queryParams: {
+    currentFilter: {
+      as: 'action',
+    },
     s: {
       as: 'filter',
       replace: true,
@@ -14,7 +17,10 @@ export default Route.extend(WithIntentionActions, {
   },
   model: function(params) {
     return hash({
-      items: this.repo.findAllByDatacenter(this.modelFor('dc').dc.Name),
+      items: this.repo.findAllByDatacenter(
+        this.modelFor('dc').dc.Name,
+        this.modelFor('nspace').nspace.substr(1)
+      ),
     });
   },
   setupController: function(controller, model) {

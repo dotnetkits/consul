@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/hashicorp/consul/lib"
-	"github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/consul/lib/decode"
 	"github.com/hashicorp/hcl"
 	"github.com/mitchellh/mapstructure"
 )
@@ -34,7 +34,7 @@ func FormatFrom(name string) string {
 }
 
 // Parse parses a config fragment in either JSON or HCL format.
-func Parse(data string, format string) (c Config, err error) {
+func Parse(data string, format string) (c Config, md mapstructure.Metadata, err error) {
 	var raw map[string]interface{}
 	switch format {
 	case "json":
@@ -45,7 +45,7 @@ func Parse(data string, format string) (c Config, err error) {
 		err = fmt.Errorf("invalid format: %s", format)
 	}
 	if err != nil {
-		return Config{}, err
+		return Config{}, mapstructure.Metadata{}, err
 	}
 
 	// We want to be able to report fields which we cannot map as an
@@ -95,6 +95,7 @@ func Parse(data string, format string) (c Config, err error) {
 		"services.proxy.upstreams",
 		"service.proxy.expose.paths",
 		"services.proxy.expose.paths",
+		"acl.tokens.managed_service_provider",
 
 		// Need all the service(s) exceptions also for nested sidecar service.
 		"service.connect.sidecar_service.checks",
@@ -107,44 +108,19 @@ func Parse(data string, format string) (c Config, err error) {
 		"config_entries.bootstrap", // completely ignore this tree (fixed elsewhere)
 	})
 
-	// There is a difference of representation of some fields depending on
-	// where they are used. The HTTP API uses CamelCase whereas the config
-	// files use snake_case and between the two there is no automatic mapping.
-	// While the JSON and HCL parsers match keys without case (both `id` and
-	// `ID` are mapped to an ID field) the same thing does not happen between
-	// CamelCase and snake_case. Since changing either format would break
-	// existing setups we have to support both and slowly transition to one of
-	// the formats. Also, there is at least one case where we use the "wrong"
-	// key and want to map that to the new key to support deprecation -
-	// see [GH-3179]. TranslateKeys maps potentially CamelCased values to the
-	// snake_case that is used in the config file parser. If both the CamelCase
-	// and snake_case values are set the snake_case value is used and the other
-	// value is discarded.
-	lib.TranslateKeys(m, map[string]string{
-		"deregistercriticalserviceafter": "deregister_critical_service_after",
-		"dockercontainerid":              "docker_container_id",
-		"scriptargs":                     "args",
-		"serviceid":                      "service_id",
-		"tlsskipverify":                  "tls_skip_verify",
-		"config_entries.bootstrap":       "",
-	})
-
-	var md mapstructure.Metadata
 	d, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
-		Metadata: &md,
-		Result:   &c,
+		DecodeHook: decode.HookTranslateKeys,
+		Metadata:   &md,
+		Result:     &c,
 	})
 	if err != nil {
-		return Config{}, err
+		return Config{}, mapstructure.Metadata{}, err
 	}
 	if err := d.Decode(m); err != nil {
-		return Config{}, err
+		return Config{}, mapstructure.Metadata{}, err
 	}
 
-	for _, k := range md.Unused {
-		err = multierror.Append(err, fmt.Errorf("invalid config key %s", k))
-	}
-	return
+	return c, md, nil
 }
 
 // Config defines the format of a configuration file in either JSON or
@@ -169,8 +145,6 @@ type Config struct {
 	ACLDownPolicy *string `json:"acl_down_policy,omitempty" hcl:"acl_down_policy" mapstructure:"acl_down_policy"`
 	// DEPRECATED (ACL-Legacy-Compat) - moved into the "acl" stanza
 	ACLEnableKeyListPolicy *bool `json:"acl_enable_key_list_policy,omitempty" hcl:"acl_enable_key_list_policy" mapstructure:"acl_enable_key_list_policy"`
-	// DEPRECATED (ACL-Legacy-Compat) -  pre-version8 enforcement is deprecated.
-	ACLEnforceVersion8 *bool `json:"acl_enforce_version_8,omitempty" hcl:"acl_enforce_version_8" mapstructure:"acl_enforce_version_8"`
 	// DEPRECATED (ACL-Legacy-Compat) - moved into the "acl" stanza
 	ACLMasterToken *string `json:"acl_master_token,omitempty" hcl:"acl_master_token" mapstructure:"acl_master_token"`
 	// DEPRECATED (ACL-Legacy-Compat) - moved into the "acl.tokens" stanza
@@ -182,7 +156,11 @@ type Config struct {
 	ACL                              ACL                      `json:"acl,omitempty" hcl:"acl" mapstructure:"acl"`
 	Addresses                        Addresses                `json:"addresses,omitempty" hcl:"addresses" mapstructure:"addresses"`
 	AdvertiseAddrLAN                 *string                  `json:"advertise_addr,omitempty" hcl:"advertise_addr" mapstructure:"advertise_addr"`
+	AdvertiseAddrLANIPv4             *string                  `json:"advertise_addr_ipv4,omitempty" hcl:"advertise_addr_ipv4" mapstructure:"advertise_addr_ipv4"`
+	AdvertiseAddrLANIPv6             *string                  `json:"advertise_addr_ipv6,omitempty" hcl:"advertise_addr_ipv6" mapstructure:"advertise_addr_ipv6"`
 	AdvertiseAddrWAN                 *string                  `json:"advertise_addr_wan,omitempty" hcl:"advertise_addr_wan" mapstructure:"advertise_addr_wan"`
+	AdvertiseAddrWANIPv4             *string                  `json:"advertise_addr_wan_ipv4,omitempty" hcl:"advertise_addr_wan_ipv4" mapstructure:"advertise_addr_wan_ipv4"`
+	AdvertiseAddrWANIPv6             *string                  `json:"advertise_addr_wan_ipv6,omitempty" hcl:"advertise_addr_wan_ipv6" mapstructure:"advertise_addr_ipv6"`
 	Autopilot                        Autopilot                `json:"autopilot,omitempty" hcl:"autopilot" mapstructure:"autopilot"`
 	BindAddr                         *string                  `json:"bind_addr,omitempty" hcl:"bind_addr" mapstructure:"bind_addr"`
 	Bootstrap                        *bool                    `json:"bootstrap,omitempty" hcl:"bootstrap" mapstructure:"bootstrap"`
@@ -204,6 +182,7 @@ type Config struct {
 	DNSRecursors                     []string                 `json:"recursors,omitempty" hcl:"recursors" mapstructure:"recursors"`
 	DataDir                          *string                  `json:"data_dir,omitempty" hcl:"data_dir" mapstructure:"data_dir"`
 	Datacenter                       *string                  `json:"datacenter,omitempty" hcl:"datacenter" mapstructure:"datacenter"`
+	DefaultQueryTime                 *string                  `json:"default_query_time,omitempty" hcl:"default_query_time" mapstructure:"default_query_time"`
 	DisableAnonymousSignature        *bool                    `json:"disable_anonymous_signature,omitempty" hcl:"disable_anonymous_signature" mapstructure:"disable_anonymous_signature"`
 	DisableCoordinates               *bool                    `json:"disable_coordinates,omitempty" hcl:"disable_coordinates" mapstructure:"disable_coordinates"`
 	DisableHostNodeID                *bool                    `json:"disable_host_node_id,omitempty" hcl:"disable_host_node_id" mapstructure:"disable_host_node_id"`
@@ -230,18 +209,21 @@ type Config struct {
 	LeaveOnTerm                      *bool                    `json:"leave_on_terminate,omitempty" hcl:"leave_on_terminate" mapstructure:"leave_on_terminate"`
 	Limits                           Limits                   `json:"limits,omitempty" hcl:"limits" mapstructure:"limits"`
 	LogLevel                         *string                  `json:"log_level,omitempty" hcl:"log_level" mapstructure:"log_level"`
+	LogJSON                          *bool                    `json:"log_json,omitempty" hcl:"log_json" mapstructure:"log_json"`
 	LogFile                          *string                  `json:"log_file,omitempty" hcl:"log_file" mapstructure:"log_file"`
 	LogRotateDuration                *string                  `json:"log_rotate_duration,omitempty" hcl:"log_rotate_duration" mapstructure:"log_rotate_duration"`
 	LogRotateBytes                   *int                     `json:"log_rotate_bytes,omitempty" hcl:"log_rotate_bytes" mapstructure:"log_rotate_bytes"`
 	LogRotateMaxFiles                *int                     `json:"log_rotate_max_files,omitempty" hcl:"log_rotate_max_files" mapstructure:"log_rotate_max_files"`
+	MaxQueryTime                     *string                  `json:"max_query_time,omitempty" hcl:"max_query_time" mapstructure:"max_query_time"`
 	NodeID                           *string                  `json:"node_id,omitempty" hcl:"node_id" mapstructure:"node_id"`
 	NodeMeta                         map[string]string        `json:"node_meta,omitempty" hcl:"node_meta" mapstructure:"node_meta"`
 	NodeName                         *string                  `json:"node_name,omitempty" hcl:"node_name" mapstructure:"node_name"`
-	NonVotingServer                  *bool                    `json:"non_voting_server,omitempty" hcl:"non_voting_server" mapstructure:"non_voting_server"`
 	Performance                      Performance              `json:"performance,omitempty" hcl:"performance" mapstructure:"performance"`
 	PidFile                          *string                  `json:"pid_file,omitempty" hcl:"pid_file" mapstructure:"pid_file"`
 	Ports                            Ports                    `json:"ports,omitempty" hcl:"ports" mapstructure:"ports"`
 	PrimaryDatacenter                *string                  `json:"primary_datacenter,omitempty" hcl:"primary_datacenter" mapstructure:"primary_datacenter"`
+	PrimaryGateways                  []string                 `json:"primary_gateways" hcl:"primary_gateways" mapstructure:"primary_gateways"`
+	PrimaryGatewaysInterval          *string                  `json:"primary_gateways_interval,omitempty" hcl:"primary_gateways_interval" mapstructure:"primary_gateways_interval"`
 	RPCProtocol                      *int                     `json:"protocol,omitempty" hcl:"protocol" mapstructure:"protocol"`
 	RaftProtocol                     *int                     `json:"raft_protocol,omitempty" hcl:"raft_protocol" mapstructure:"raft_protocol"`
 	RaftSnapshotThreshold            *int                     `json:"raft_snapshot_threshold,omitempty" hcl:"raft_snapshot_threshold" mapstructure:"raft_snapshot_threshold"`
@@ -256,8 +238,8 @@ type Config struct {
 	RetryJoinMaxAttemptsLAN          *int                     `json:"retry_max,omitempty" hcl:"retry_max" mapstructure:"retry_max"`
 	RetryJoinMaxAttemptsWAN          *int                     `json:"retry_max_wan,omitempty" hcl:"retry_max_wan" mapstructure:"retry_max_wan"`
 	RetryJoinWAN                     []string                 `json:"retry_join_wan,omitempty" hcl:"retry_join_wan" mapstructure:"retry_join_wan"`
-	SegmentName                      *string                  `json:"segment,omitempty" hcl:"segment" mapstructure:"segment"`
-	Segments                         []Segment                `json:"segments,omitempty" hcl:"segments" mapstructure:"segments"`
+	SerfAllowedCIDRsLAN              []string                 `json:"serf_lan_allowed_cidrs,omitempty" hcl:"serf_lan_allowed_cidrs" mapstructure:"serf_lan_allowed_cidrs"`
+	SerfAllowedCIDRsWAN              []string                 `json:"serf_wan_allowed_cidrs,omitempty" hcl:"serf_wan_allowed_cidrs" mapstructure:"serf_wan_allowed_cidrs"`
 	SerfBindAddrLAN                  *string                  `json:"serf_lan,omitempty" hcl:"serf_lan" mapstructure:"serf_lan"`
 	SerfBindAddrWAN                  *string                  `json:"serf_wan,omitempty" hcl:"serf_wan" mapstructure:"serf_wan"`
 	ServerMode                       *bool                    `json:"server,omitempty" hcl:"server" mapstructure:"server"`
@@ -306,6 +288,15 @@ type Config struct {
 	SyncCoordinateRateTarget   *float64 `json:"sync_coordinate_rate_target,omitempty" hcl:"sync_coordinate_rate_target" mapstructure:"sync_coordinate_rate_target"`
 	Version                    *string  `json:"version,omitempty" hcl:"version" mapstructure:"version"`
 	VersionPrerelease          *string  `json:"version_prerelease,omitempty" hcl:"version_prerelease" mapstructure:"version_prerelease"`
+
+	// Enterprise Only
+	Audit *Audit `json:"audit,omitempty" hcl:"audit" mapstructure:"audit"`
+	// Enterprise Only
+	NonVotingServer *bool `json:"non_voting_server,omitempty" hcl:"non_voting_server" mapstructure:"non_voting_server"`
+	// Enterprise Only
+	SegmentName *string `json:"segment,omitempty" hcl:"segment" mapstructure:"segment"`
+	// Enterprise Only
+	Segments []Segment `json:"segments,omitempty" hcl:"segments" mapstructure:"segments"`
 }
 
 type GossipLANConfig struct {
@@ -359,12 +350,17 @@ type AdvertiseAddrsConfig struct {
 
 type Autopilot struct {
 	CleanupDeadServers      *bool   `json:"cleanup_dead_servers,omitempty" hcl:"cleanup_dead_servers" mapstructure:"cleanup_dead_servers"`
-	DisableUpgradeMigration *bool   `json:"disable_upgrade_migration,omitempty" hcl:"disable_upgrade_migration" mapstructure:"disable_upgrade_migration"`
 	LastContactThreshold    *string `json:"last_contact_threshold,omitempty" hcl:"last_contact_threshold" mapstructure:"last_contact_threshold"`
 	MaxTrailingLogs         *int    `json:"max_trailing_logs,omitempty" hcl:"max_trailing_logs" mapstructure:"max_trailing_logs"`
-	RedundancyZoneTag       *string `json:"redundancy_zone_tag,omitempty" hcl:"redundancy_zone_tag" mapstructure:"redundancy_zone_tag"`
+	MinQuorum               *uint   `json:"min_quorum,omitempty" hcl:"min_quorum" mapstructure:"min_quorum"`
 	ServerStabilizationTime *string `json:"server_stabilization_time,omitempty" hcl:"server_stabilization_time" mapstructure:"server_stabilization_time"`
-	UpgradeVersionTag       *string `json:"upgrade_version_tag,omitempty" hcl:"upgrade_version_tag" mapstructure:"upgrade_version_tag"`
+
+	// Enterprise Only
+	DisableUpgradeMigration *bool `json:"disable_upgrade_migration,omitempty" hcl:"disable_upgrade_migration" mapstructure:"disable_upgrade_migration"`
+	// Enterprise Only
+	RedundancyZoneTag *string `json:"redundancy_zone_tag,omitempty" hcl:"redundancy_zone_tag" mapstructure:"redundancy_zone_tag"`
+	// Enterprise Only
+	UpgradeVersionTag *string `json:"upgrade_version_tag,omitempty" hcl:"upgrade_version_tag" mapstructure:"upgrade_version_tag"`
 }
 
 // ServiceWeights defines the registration of weights used in DNS for a Service
@@ -394,34 +390,39 @@ type ServiceDefinition struct {
 	EnableTagOverride *bool                     `json:"enable_tag_override,omitempty" hcl:"enable_tag_override" mapstructure:"enable_tag_override"`
 	Proxy             *ServiceProxy             `json:"proxy,omitempty" hcl:"proxy" mapstructure:"proxy"`
 	Connect           *ServiceConnect           `json:"connect,omitempty" hcl:"connect" mapstructure:"connect"`
+
+	EnterpriseMeta `hcl:",squash" mapstructure:",squash"`
 }
 
 type CheckDefinition struct {
 	ID                             *string             `json:"id,omitempty" hcl:"id" mapstructure:"id"`
 	Name                           *string             `json:"name,omitempty" hcl:"name" mapstructure:"name"`
 	Notes                          *string             `json:"notes,omitempty" hcl:"notes" mapstructure:"notes"`
-	ServiceID                      *string             `json:"service_id,omitempty" hcl:"service_id" mapstructure:"service_id"`
+	ServiceID                      *string             `json:"service_id,omitempty" hcl:"service_id" mapstructure:"service_id" alias:"serviceid"`
 	Token                          *string             `json:"token,omitempty" hcl:"token" mapstructure:"token"`
 	Status                         *string             `json:"status,omitempty" hcl:"status" mapstructure:"status"`
-	ScriptArgs                     []string            `json:"args,omitempty" hcl:"args" mapstructure:"args"`
+	ScriptArgs                     []string            `json:"args,omitempty" hcl:"args" mapstructure:"args" alias:"scriptargs"`
 	HTTP                           *string             `json:"http,omitempty" hcl:"http" mapstructure:"http"`
 	Header                         map[string][]string `json:"header,omitempty" hcl:"header" mapstructure:"header"`
 	Method                         *string             `json:"method,omitempty" hcl:"method" mapstructure:"method"`
+	Body                           *string             `json:"body,omitempty" hcl:"body" mapstructure:"body"`
 	OutputMaxSize                  *int                `json:"output_max_size,omitempty" hcl:"output_max_size" mapstructure:"output_max_size"`
 	TCP                            *string             `json:"tcp,omitempty" hcl:"tcp" mapstructure:"tcp"`
 	Interval                       *string             `json:"interval,omitempty" hcl:"interval" mapstructure:"interval"`
-	DockerContainerID              *string             `json:"docker_container_id,omitempty" hcl:"docker_container_id" mapstructure:"docker_container_id"`
+	DockerContainerID              *string             `json:"docker_container_id,omitempty" hcl:"docker_container_id" mapstructure:"docker_container_id" alias:"dockercontainerid"`
 	Shell                          *string             `json:"shell,omitempty" hcl:"shell" mapstructure:"shell"`
 	GRPC                           *string             `json:"grpc,omitempty" hcl:"grpc" mapstructure:"grpc"`
 	GRPCUseTLS                     *bool               `json:"grpc_use_tls,omitempty" hcl:"grpc_use_tls" mapstructure:"grpc_use_tls"`
-	TLSSkipVerify                  *bool               `json:"tls_skip_verify,omitempty" hcl:"tls_skip_verify" mapstructure:"tls_skip_verify"`
+	TLSSkipVerify                  *bool               `json:"tls_skip_verify,omitempty" hcl:"tls_skip_verify" mapstructure:"tls_skip_verify" alias:"tlsskipverify"`
 	AliasNode                      *string             `json:"alias_node,omitempty" hcl:"alias_node" mapstructure:"alias_node"`
 	AliasService                   *string             `json:"alias_service,omitempty" hcl:"alias_service" mapstructure:"alias_service"`
 	Timeout                        *string             `json:"timeout,omitempty" hcl:"timeout" mapstructure:"timeout"`
 	TTL                            *string             `json:"ttl,omitempty" hcl:"ttl" mapstructure:"ttl"`
 	SuccessBeforePassing           *int                `json:"success_before_passing,omitempty" hcl:"success_before_passing" mapstructure:"success_before_passing"`
 	FailuresBeforeCritical         *int                `json:"failures_before_critical,omitempty" hcl:"failures_before_critical" mapstructure:"failures_before_critical"`
-	DeregisterCriticalServiceAfter *string             `json:"deregister_critical_service_after,omitempty" hcl:"deregister_critical_service_after" mapstructure:"deregister_critical_service_after"`
+	DeregisterCriticalServiceAfter *string             `json:"deregister_critical_service_after,omitempty" hcl:"deregister_critical_service_after" mapstructure:"deregister_critical_service_after" alias:"deregistercriticalserviceafter"`
+
+	EnterpriseMeta `hcl:",squash" mapstructure:",squash"`
 }
 
 // ServiceConnect is the connect block within a service registration
@@ -557,6 +558,12 @@ type AutoEncrypt struct {
 	// TLS enables receiving certificates for clients from servers
 	TLS *bool `json:"tls,omitempty" hcl:"tls" mapstructure:"tls"`
 
+	// Additional DNS SAN entries that clients request for their certificates.
+	DNSSAN []string `json:"dns_san,omitempty" hcl:"dns_san" mapstructure:"dns_san"`
+
+	// Additional IP SAN entries that clients request for their certificates.
+	IPSAN []string `json:"ip_san,omitempty" hcl:"ip_san" mapstructure:"ip_san"`
+
 	// AllowTLS enables the RPC endpoint on the server to answer
 	// AutoEncrypt.Sign requests.
 	AllowTLS *bool `json:"allow_tls,omitempty" hcl:"allow_tls" mapstructure:"allow_tls"`
@@ -566,9 +573,10 @@ type AutoEncrypt struct {
 type Connect struct {
 	// Enabled opts the agent into connect. It should be set on all clients and
 	// servers in a cluster for correct connect operation.
-	Enabled    *bool                  `json:"enabled,omitempty" hcl:"enabled" mapstructure:"enabled"`
-	CAProvider *string                `json:"ca_provider,omitempty" hcl:"ca_provider" mapstructure:"ca_provider"`
-	CAConfig   map[string]interface{} `json:"ca_config,omitempty" hcl:"ca_config" mapstructure:"ca_config"`
+	Enabled                         *bool                  `json:"enabled,omitempty" hcl:"enabled" mapstructure:"enabled"`
+	CAProvider                      *string                `json:"ca_provider,omitempty" hcl:"ca_provider" mapstructure:"ca_provider"`
+	CAConfig                        map[string]interface{} `json:"ca_config,omitempty" hcl:"ca_config" mapstructure:"ca_config"`
+	MeshGatewayWANFederationEnabled *bool                  `json:"enable_mesh_gateway_wan_federation" hcl:"enable_mesh_gateway_wan_federation" mapstructure:"enable_mesh_gateway_wan_federation"`
 }
 
 // SOA is the configuration of SOA for DNS
@@ -594,6 +602,9 @@ type DNS struct {
 	SOA                *SOA              `json:"soa,omitempty" hcl:"soa" mapstructure:"soa"`
 	UseCache           *bool             `json:"use_cache,omitempty" hcl:"use_cache" mapstructure:"use_cache"`
 	CacheMaxAge        *string           `json:"cache_max_age,omitempty" hcl:"cache_max_age" mapstructure:"cache_max_age"`
+
+	// Enterprise Only
+	PreferNamespace *bool `json:"prefer_namespace,omitempty" hcl:"prefer_namespace" mapstructure:"prefer_namespace"`
 }
 
 type HTTPConfig struct {
@@ -656,9 +667,14 @@ type UnixSocket struct {
 }
 
 type Limits struct {
-	RPCMaxBurst    *int     `json:"rpc_max_burst,omitempty" hcl:"rpc_max_burst" mapstructure:"rpc_max_burst"`
-	RPCRate        *float64 `json:"rpc_rate,omitempty" hcl:"rpc_rate" mapstructure:"rpc_rate"`
-	KVMaxValueSize *uint64  `json:"kv_max_value_size,omitempty" hcl:"kv_max_value_size" mapstructure:"kv_max_value_size"`
+	HTTPMaxConnsPerClient *int     `json:"http_max_conns_per_client,omitempty" hcl:"http_max_conns_per_client" mapstructure:"http_max_conns_per_client"`
+	HTTPSHandshakeTimeout *string  `json:"https_handshake_timeout,omitempty" hcl:"https_handshake_timeout" mapstructure:"https_handshake_timeout"`
+	RPCHandshakeTimeout   *string  `json:"rpc_handshake_timeout,omitempty" hcl:"rpc_handshake_timeout" mapstructure:"rpc_handshake_timeout"`
+	RPCMaxBurst           *int     `json:"rpc_max_burst,omitempty" hcl:"rpc_max_burst" mapstructure:"rpc_max_burst"`
+	RPCMaxConnsPerClient  *int     `json:"rpc_max_conns_per_client,omitempty" hcl:"rpc_max_conns_per_client" mapstructure:"rpc_max_conns_per_client"`
+	RPCRate               *float64 `json:"rpc_rate,omitempty" hcl:"rpc_rate" mapstructure:"rpc_rate"`
+	KVMaxValueSize        *uint64  `json:"kv_max_value_size,omitempty" hcl:"kv_max_value_size" mapstructure:"kv_max_value_size"`
+	TxnMaxReqLen          *uint64  `json:"txn_max_req_len,omitempty" hcl:"txn_max_req_len" mapstructure:"txn_max_req_len"`
 }
 
 type Segment struct {
@@ -681,6 +697,9 @@ type ACL struct {
 	Tokens                 Tokens  `json:"tokens,omitempty" hcl:"tokens" mapstructure:"tokens"`
 	DisabledTTL            *string `json:"disabled_ttl,omitempty" hcl:"disabled_ttl" mapstructure:"disabled_ttl"`
 	EnableTokenPersistence *bool   `json:"enable_token_persistence" hcl:"enable_token_persistence" mapstructure:"enable_token_persistence"`
+
+	// Enterprise Only
+	MSPDisableBootstrap *bool `json:"msp_disable_bootstrap" hcl:"msp_disable_bootstrap" mapstructure:"msp_disable_bootstrap"`
 }
 
 type Tokens struct {
@@ -689,6 +708,15 @@ type Tokens struct {
 	AgentMaster *string `json:"agent_master,omitempty" hcl:"agent_master" mapstructure:"agent_master"`
 	Default     *string `json:"default,omitempty" hcl:"default" mapstructure:"default"`
 	Agent       *string `json:"agent,omitempty" hcl:"agent" mapstructure:"agent"`
+
+	// Enterprise Only
+	ManagedServiceProvider []ServiceProviderToken `json:"managed_service_provider,omitempty" hcl:"managed_service_provider" mapstructure:"managed_service_provider"`
+}
+
+// ServiceProviderToken groups an accessor and secret for a service provider token. Enterprise Only
+type ServiceProviderToken struct {
+	AccessorID *string `json:"accessor_id,omitempty" hcl:"accessor_id" mapstructure:"accessor_id"`
+	SecretID   *string `json:"secret_id,omitempty" hcl:"secret_id" mapstructure:"secret_id"`
 }
 
 type ConfigEntries struct {
@@ -698,4 +726,22 @@ type ConfigEntries struct {
 	// need to figure out the right concrete type before we can decode it
 	// unabiguously.
 	Bootstrap []map[string]interface{} `json:"bootstrap,omitempty" hcl:"bootstrap" mapstructure:"bootstrap"`
+}
+
+// Audit allows us to enable and define destinations for auditing
+type Audit struct {
+	Enabled *bool                `json:"enabled,omitempty" hcl:"enabled" mapstructure:"enabled"`
+	Sinks   map[string]AuditSink `json:"sink,omitempty"    hcl:"sink"    mapstructure:"sink"`
+}
+
+// AuditSink can be provided multiple times to define pipelines for auditing
+type AuditSink struct {
+	Name              *string `json:"name,omitempty"               hcl:"name"               mapstructure:"name"`
+	Type              *string `json:"type,omitempty"               hcl:"type"               mapstructure:"type"`
+	Format            *string `json:"format,omitempty"             hcl:"format"             mapstructure:"format"`
+	Path              *string `json:"path,omitempty"               hcl:"path"               mapstructure:"path"`
+	DeliveryGuarantee *string `json:"delivery_guarantee,omitempty" hcl:"delivery_guarantee" mapstructure:"delivery_guarantee"`
+	RotateBytes       *int    `json:"rotate_bytes,omitempty"       hcl:"rotate_bytes"       mapstructure:"rotate_bytes"`
+	RotateDuration    *string `json:"rotate_duration,omitempty"    hcl:"rotate_duration"    mapstructure:"rotate_duration"`
+	RotateMaxFiles    *int    `json:"rotate_max_files,omitempty"   hcl:"rotate_max_files"   mapstructure:"rotate_max_files"`
 }

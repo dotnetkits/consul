@@ -3,9 +3,9 @@ package structs
 import (
 	"encoding/json"
 	"fmt"
+
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/lib"
-	"log"
 )
 
 const (
@@ -114,10 +114,42 @@ type ConnectProxyConfig struct {
 	Upstreams Upstreams `json:",omitempty"`
 
 	// MeshGateway defines the mesh gateway configuration for this upstream
-	MeshGateway MeshGatewayConfig `json:",omitempty"`
+	MeshGateway MeshGatewayConfig `json:",omitempty" alias:"mesh_gateway"`
 
 	// Expose defines whether checks or paths are exposed through the proxy
 	Expose ExposeConfig `json:",omitempty"`
+}
+
+func (t *ConnectProxyConfig) UnmarshalJSON(data []byte) (err error) {
+	type Alias ConnectProxyConfig
+	aux := &struct {
+		DestinationServiceNameSnake string `json:"destination_service_name"`
+		DestinationServiceIDSnake   string `json:"destination_service_id"`
+		LocalServiceAddressSnake    string `json:"local_service_address"`
+		LocalServicePortSnake       int    `json:"local_service_port"`
+
+		*Alias
+	}{
+		Alias: (*Alias)(t),
+	}
+	if err = lib.UnmarshalJSON(data, &aux); err != nil {
+		return err
+	}
+	if t.DestinationServiceName == "" {
+		t.DestinationServiceName = aux.DestinationServiceNameSnake
+	}
+	if t.DestinationServiceID == "" {
+		t.DestinationServiceID = aux.DestinationServiceIDSnake
+	}
+	if t.LocalServiceAddress == "" {
+		t.LocalServiceAddress = aux.LocalServiceAddressSnake
+	}
+	if t.LocalServicePort == 0 {
+		t.LocalServicePort = aux.LocalServicePortSnake
+	}
+
+	return nil
+
 }
 
 func (c *ConnectProxyConfig) MarshalJSON() ([]byte, error) {
@@ -215,6 +247,46 @@ type Upstream struct {
 
 	// MeshGateway is the configuration for mesh gateway usage of this upstream
 	MeshGateway MeshGatewayConfig `json:",omitempty"`
+
+	// IngressHosts are a list of hosts that should route to this upstream from
+	// an ingress gateway. This cannot and should not be set by a user, it is
+	// used internally to store the association of hosts to an upstream service.
+	IngressHosts []string `json:"-" bexpr:"-"`
+}
+
+func (t *Upstream) UnmarshalJSON(data []byte) (err error) {
+	type Alias Upstream
+	aux := &struct {
+		DestinationTypeSnake      string `json:"destination_type"`
+		DestinationNamespaceSnake string `json:"destination_namespace"`
+		DestinationNameSnake      string `json:"destination_name"`
+		LocalBindPortSnake        int    `json:"local_bind_port"`
+		LocalBindAddressSnake     string `json:"local_bind_address"`
+
+		*Alias
+	}{
+		Alias: (*Alias)(t),
+	}
+	if err = lib.UnmarshalJSON(data, &aux); err != nil {
+		return err
+	}
+	if t.DestinationType == "" {
+		t.DestinationType = aux.DestinationTypeSnake
+	}
+	if t.DestinationNamespace == "" {
+		t.DestinationNamespace = aux.DestinationNamespaceSnake
+	}
+	if t.DestinationName == "" {
+		t.DestinationName = aux.DestinationNameSnake
+	}
+	if t.LocalBindPort == 0 {
+		t.LocalBindPort = aux.LocalBindPortSnake
+	}
+	if t.LocalBindAddress == "" {
+		t.LocalBindAddress = aux.LocalBindAddressSnake
+	}
+
+	return nil
 }
 
 // Validate sanity checks the struct is valid
@@ -289,13 +361,15 @@ func (k UpstreamKey) String() string {
 // upstream in a canonical but human readable way.
 func (u *Upstream) Identifier() string {
 	name := u.DestinationName
-	if u.DestinationNamespace != "" && u.DestinationNamespace != "default" {
+	typ := u.DestinationType
+
+	if typ != UpstreamDestTypePreparedQuery && u.DestinationNamespace != "" && u.DestinationNamespace != IntentionDefaultNamespace {
 		name = u.DestinationNamespace + "/" + u.DestinationName
 	}
 	if u.Datacenter != "" {
 		name += "?dc=" + u.Datacenter
 	}
-	typ := u.DestinationType
+
 	// Service is default type so never prefix it. This is more readable and long
 	// term it is the only type that matters so we can drop the prefix and have
 	// nicer naming in metrics etc.
@@ -336,13 +410,13 @@ type ExposeConfig struct {
 
 type ExposePath struct {
 	// ListenerPort defines the port of the proxy's listener for exposed paths.
-	ListenerPort int `json:",omitempty"`
+	ListenerPort int `json:",omitempty" alias:"listener_port"`
 
 	// ExposePath is the path to expose through the proxy, ie. "/metrics."
 	Path string `json:",omitempty"`
 
 	// LocalPathPort is the port that the service is listening on for the given path.
-	LocalPathPort int `json:",omitempty"`
+	LocalPathPort int `json:",omitempty" alias:"local_path_port"`
 
 	// Protocol describes the upstream's service protocol.
 	// Valid values are "http" and "http2", defaults to "http"
@@ -350,6 +424,29 @@ type ExposePath struct {
 
 	// ParsedFromCheck is set if this path was parsed from a registered check
 	ParsedFromCheck bool
+}
+
+func (t *ExposePath) UnmarshalJSON(data []byte) (err error) {
+	type Alias ExposePath
+	aux := &struct {
+		LocalPathPortSnake int `json:"local_path_port"`
+		ListenerPortSnake  int `json:"listener_port"`
+
+		*Alias
+	}{
+		Alias: (*Alias)(t),
+	}
+	if err = lib.UnmarshalJSON(data, &aux); err != nil {
+		return err
+	}
+	if t.LocalPathPort == 0 {
+		t.LocalPathPort = aux.LocalPathPortSnake
+	}
+	if t.ListenerPort == 0 {
+		t.ListenerPort = aux.ListenerPortSnake
+	}
+
+	return nil
 }
 
 func (e *ExposeConfig) ToAPI() api.ExposeConfig {
@@ -378,7 +475,7 @@ func (p *ExposePath) ToAPI() api.ExposePath {
 }
 
 // Finalize validates ExposeConfig and sets default values
-func (e *ExposeConfig) Finalize(l *log.Logger) {
+func (e *ExposeConfig) Finalize() {
 	for i := 0; i < len(e.Paths); i++ {
 		path := &e.Paths[i]
 

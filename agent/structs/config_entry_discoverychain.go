@@ -12,6 +12,7 @@ import (
 
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/cache"
+	"github.com/hashicorp/consul/lib"
 	"github.com/mitchellh/hashstructure"
 )
 
@@ -37,6 +38,7 @@ type ServiceRouterConfigEntry struct {
 	// the default service.
 	Routes []ServiceRoute
 
+	EnterpriseMeta `hcl:",squash" mapstructure:",squash"`
 	RaftIndex
 }
 
@@ -59,6 +61,8 @@ func (e *ServiceRouterConfigEntry) Normalize() error {
 
 	e.Kind = ServiceRouter
 
+	e.EnterpriseMeta.Normalize()
+
 	for _, route := range e.Routes {
 		if route.Match == nil || route.Match.HTTP == nil {
 			continue
@@ -71,6 +75,9 @@ func (e *ServiceRouterConfigEntry) Normalize() error {
 
 		for j := 0; j < len(httpMatch.Methods); j++ {
 			httpMatch.Methods[j] = strings.ToUpper(httpMatch.Methods[j])
+		}
+		if route.Destination != nil && route.Destination.Namespace == "" {
+			route.Destination.Namespace = e.EnterpriseMeta.NamespaceOrDefault()
 		}
 	}
 
@@ -193,15 +200,19 @@ func (e *ServiceRouterConfigEntry) GetRaftIndex() *RaftIndex {
 	return &e.RaftIndex
 }
 
-func (e *ServiceRouterConfigEntry) ListRelatedServices() []string {
-	found := make(map[string]struct{})
+func (e *ServiceRouterConfigEntry) ListRelatedServices() []ServiceID {
+	found := make(map[ServiceID]struct{})
 
 	// We always inject a default catch-all route to the same service as the router.
-	found[e.Name] = struct{}{}
+	svcID := NewServiceID(e.Name, &e.EnterpriseMeta)
+	found[svcID] = struct{}{}
 
 	for _, route := range e.Routes {
-		if route.Destination != nil && route.Destination.Service != "" {
-			found[route.Destination.Service] = struct{}{}
+		if route.Destination != nil {
+			destID := NewServiceID(defaultIfEmpty(route.Destination.Service, e.Name), route.Destination.GetEnterpriseMeta(&e.EnterpriseMeta))
+			if destID != svcID {
+				found[destID] = struct{}{}
+			}
 		}
 	}
 
@@ -209,12 +220,23 @@ func (e *ServiceRouterConfigEntry) ListRelatedServices() []string {
 		return nil
 	}
 
-	out := make([]string, 0, len(found))
+	out := make([]ServiceID, 0, len(found))
 	for svc, _ := range found {
 		out = append(out, svc)
 	}
-	sort.Strings(out)
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].EnterpriseMeta.LessThan(&out[j].EnterpriseMeta) ||
+			out[i].ID < out[j].ID
+	})
 	return out
+}
+
+func (e *ServiceRouterConfigEntry) GetEnterpriseMeta() *EnterpriseMeta {
+	if e == nil {
+		return nil
+	}
+
+	return &e.EnterpriseMeta
 }
 
 // ServiceRoute is a single routing rule that routes traffic to the destination
@@ -238,12 +260,12 @@ func (m *ServiceRouteMatch) IsEmpty() bool {
 
 // ServiceRouteHTTPMatch is a set of http-specific match criteria.
 type ServiceRouteHTTPMatch struct {
-	PathExact  string `json:",omitempty"`
-	PathPrefix string `json:",omitempty"`
-	PathRegex  string `json:",omitempty"`
+	PathExact  string `json:",omitempty" alias:"path_exact"`
+	PathPrefix string `json:",omitempty" alias:"path_prefix"`
+	PathRegex  string `json:",omitempty" alias:"path_regex"`
 
 	Header     []ServiceRouteHTTPMatchHeader     `json:",omitempty"`
-	QueryParam []ServiceRouteHTTPMatchQueryParam `json:",omitempty"`
+	QueryParam []ServiceRouteHTTPMatchQueryParam `json:",omitempty" alias:"query_param"`
 	Methods    []string                          `json:",omitempty"`
 }
 
@@ -286,7 +308,7 @@ type ServiceRouteDestination struct {
 	//
 	// If this field is specified then this route is ineligible for further
 	// splitting.
-	ServiceSubset string `json:",omitempty"`
+	ServiceSubset string `json:",omitempty" alias:"service_subset"`
 
 	// Namespace is the namespace to resolve the service from instead of the
 	// current namespace. If empty the current namespace is assumed.
@@ -298,24 +320,24 @@ type ServiceRouteDestination struct {
 	// PrefixRewrite allows for the proxied request to have its matching path
 	// prefix modified before being sent to the destination. Described more
 	// below in the envoy implementation section.
-	PrefixRewrite string `json:",omitempty"`
+	PrefixRewrite string `json:",omitempty" alias:"prefix_rewrite"`
 
 	// RequestTimeout is the total amount of time permitted for the entire
 	// downstream request (and retries) to be processed.
-	RequestTimeout time.Duration `json:",omitempty"`
+	RequestTimeout time.Duration `json:",omitempty" alias:"request_timeout"`
 
 	// NumRetries is the number of times to retry the request when a retryable
 	// result occurs. This seems fairly proxy agnostic.
-	NumRetries uint32 `json:",omitempty"`
+	NumRetries uint32 `json:",omitempty" alias:"num_retries"`
 
 	// RetryOnConnectFailure allows for connection failure errors to trigger a
 	// retry. This should be expressible in other proxies as it's just a layer
 	// 4 failure bubbling up to layer 7.
-	RetryOnConnectFailure bool `json:",omitempty"`
+	RetryOnConnectFailure bool `json:",omitempty" alias:"retry_on_connect_failure"`
 
 	// RetryOnStatusCodes is a flat list of http response status codes that are
 	// eligible for retry. This again should be feasible in any sane proxy.
-	RetryOnStatusCodes []uint32 `json:",omitempty"`
+	RetryOnStatusCodes []uint32 `json:",omitempty" alias:"retry_on_status_codes"`
 }
 
 func (e *ServiceRouteDestination) MarshalJSON() ([]byte, error) {
@@ -342,7 +364,7 @@ func (e *ServiceRouteDestination) UnmarshalJSON(data []byte) error {
 	}{
 		Alias: (*Alias)(e),
 	}
-	if err := json.Unmarshal(data, &aux); err != nil {
+	if err := lib.UnmarshalJSON(data, &aux); err != nil {
 		return err
 	}
 	var err error
@@ -385,6 +407,7 @@ type ServiceSplitterConfigEntry struct {
 	// to the FIRST split.
 	Splits []ServiceSplit
 
+	EnterpriseMeta `hcl:",squash" mapstructure:",squash"`
 	RaftIndex
 }
 
@@ -410,8 +433,13 @@ func (e *ServiceSplitterConfigEntry) Normalize() error {
 	// This slightly massages inputs to enforce that the smallest representable
 	// weight is 1/10000 or .01%
 
+	e.EnterpriseMeta.Normalize()
+
 	if len(e.Splits) > 0 {
 		for i, split := range e.Splits {
+			if split.Namespace == "" {
+				split.Namespace = e.EnterpriseMeta.NamespaceOrDefault()
+			}
 			e.Splits[i].Weight = NormalizeServiceSplitWeight(split.Weight)
 		}
 	}
@@ -421,7 +449,7 @@ func (e *ServiceSplitterConfigEntry) Normalize() error {
 
 func NormalizeServiceSplitWeight(weight float32) float32 {
 	weightScaled := scaleWeight(weight)
-	return float32(float32(weightScaled) / 100.0)
+	return float32(weightScaled) / 100.0
 }
 
 func (e *ServiceSplitterConfigEntry) Validate() error {
@@ -492,12 +520,23 @@ func (e *ServiceSplitterConfigEntry) GetRaftIndex() *RaftIndex {
 	return &e.RaftIndex
 }
 
-func (e *ServiceSplitterConfigEntry) ListRelatedServices() []string {
-	found := make(map[string]struct{})
+func (e *ServiceSplitterConfigEntry) GetEnterpriseMeta() *EnterpriseMeta {
+	if e == nil {
+		return nil
+	}
 
+	return &e.EnterpriseMeta
+}
+
+func (e *ServiceSplitterConfigEntry) ListRelatedServices() []ServiceID {
+	found := make(map[ServiceID]struct{})
+
+	svcID := NewServiceID(e.Name, &e.EnterpriseMeta)
 	for _, split := range e.Splits {
-		if split.Service != "" {
-			found[split.Service] = struct{}{}
+		splitID := NewServiceID(defaultIfEmpty(split.Service, e.Name), split.GetEnterpriseMeta(&e.EnterpriseMeta))
+
+		if splitID != svcID {
+			found[splitID] = struct{}{}
 		}
 	}
 
@@ -505,11 +544,14 @@ func (e *ServiceSplitterConfigEntry) ListRelatedServices() []string {
 		return nil
 	}
 
-	out := make([]string, 0, len(found))
+	out := make([]ServiceID, 0, len(found))
 	for svc, _ := range found {
 		out = append(out, svc)
 	}
-	sort.Strings(out)
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].EnterpriseMeta.LessThan(&out[j].EnterpriseMeta) ||
+			out[i].ID < out[j].ID
+	})
 	return out
 }
 
@@ -534,7 +576,7 @@ type ServiceSplit struct {
 	//
 	// If this field is specified then this route is ineligible for further
 	// splitting.
-	ServiceSubset string `json:",omitempty"`
+	ServiceSubset string `json:",omitempty" alias:"service_subset"`
 
 	// Namespace is the namespace to resolve the service from instead of the
 	// current namespace. If empty the current namespace is assumed (optional).
@@ -562,7 +604,7 @@ type ServiceResolverConfigEntry struct {
 
 	// DefaultSubset is the subset to use when no explicit subset is
 	// requested. If empty the unnamed subset is used.
-	DefaultSubset string `json:",omitempty"`
+	DefaultSubset string `json:",omitempty" alias:"default_subset"`
 
 	// Subsets is a map of subset name to subset definition for all
 	// usable named subsets of this service. The map key is the name
@@ -595,8 +637,9 @@ type ServiceResolverConfigEntry struct {
 
 	// ConnectTimeout is the timeout for establishing new network connections
 	// to this service.
-	ConnectTimeout time.Duration `json:",omitempty"`
+	ConnectTimeout time.Duration `json:",omitempty" alias:"connect_timeout"`
 
+	EnterpriseMeta `hcl:",squash" mapstructure:",squash"`
 	RaftIndex
 }
 
@@ -624,7 +667,7 @@ func (e *ServiceResolverConfigEntry) UnmarshalJSON(data []byte) error {
 	}{
 		Alias: (*Alias)(e),
 	}
-	if err := json.Unmarshal(data, &aux); err != nil {
+	if err := lib.UnmarshalJSON(data, &aux); err != nil {
 		return err
 	}
 	var err error
@@ -673,6 +716,8 @@ func (e *ServiceResolverConfigEntry) Normalize() error {
 	}
 
 	e.Kind = ServiceResolver
+
+	e.EnterpriseMeta.Normalize()
 
 	return nil
 }
@@ -781,19 +826,30 @@ func (e *ServiceResolverConfigEntry) GetRaftIndex() *RaftIndex {
 	return &e.RaftIndex
 }
 
-func (e *ServiceResolverConfigEntry) ListRelatedServices() []string {
-	found := make(map[string]struct{})
+func (e *ServiceResolverConfigEntry) GetEnterpriseMeta() *EnterpriseMeta {
+	if e == nil {
+		return nil
+	}
 
+	return &e.EnterpriseMeta
+}
+
+func (e *ServiceResolverConfigEntry) ListRelatedServices() []ServiceID {
+	found := make(map[ServiceID]struct{})
+
+	svcID := NewServiceID(e.Name, &e.EnterpriseMeta)
 	if e.Redirect != nil {
-		if e.Redirect.Service != "" {
-			found[e.Redirect.Service] = struct{}{}
+		redirectID := NewServiceID(defaultIfEmpty(e.Redirect.Service, e.Name), e.Redirect.GetEnterpriseMeta(&e.EnterpriseMeta))
+		if redirectID != svcID {
+			found[redirectID] = struct{}{}
 		}
 	}
 
 	if len(e.Failover) > 0 {
 		for _, failover := range e.Failover {
-			if failover.Service != "" {
-				found[failover.Service] = struct{}{}
+			failoverID := NewServiceID(defaultIfEmpty(failover.Service, e.Name), failover.GetEnterpriseMeta(&e.EnterpriseMeta))
+			if failoverID != svcID {
+				found[failoverID] = struct{}{}
 			}
 		}
 	}
@@ -802,11 +858,14 @@ func (e *ServiceResolverConfigEntry) ListRelatedServices() []string {
 		return nil
 	}
 
-	out := make([]string, 0, len(found))
+	out := make([]ServiceID, 0, len(found))
 	for svc, _ := range found {
 		out = append(out, svc)
 	}
-	sort.Strings(out)
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].EnterpriseMeta.LessThan(&out[j].EnterpriseMeta) ||
+			out[i].ID < out[j].ID
+	})
 	return out
 }
 
@@ -825,7 +884,7 @@ type ServiceResolverSubset struct {
 	// to true, only instances with checks in the passing state will be
 	// returned. (behaves identically to the similarly named field on prepared
 	// queries).
-	OnlyPassing bool `json:",omitempty"`
+	OnlyPassing bool `json:",omitempty" alias:"only_passing"`
 }
 
 type ServiceResolverRedirect struct {
@@ -839,7 +898,7 @@ type ServiceResolverRedirect struct {
 	//
 	// If this is specified at least one of Service, Datacenter, or Namespace
 	// should be configured.
-	ServiceSubset string `json:",omitempty"`
+	ServiceSubset string `json:",omitempty" alias:"service_subset"`
 
 	// Namespace is the namespace to resolve the service from instead of the
 	// current one (optional).
@@ -867,7 +926,7 @@ type ServiceResolverFailover struct {
 	// requested service is used (optional).
 	//
 	// This is a DESTINATION during failover.
-	ServiceSubset string `json:",omitempty"`
+	ServiceSubset string `json:",omitempty" alias:"service_subset"`
 
 	// Namespace is the namespace to resolve the requested service from to form
 	// the failover group of instances. If empty the current namespace is used
@@ -888,28 +947,36 @@ type discoveryChainConfigEntry interface {
 	ConfigEntry
 	// ListRelatedServices returns a list of other names of services referenced
 	// in this config entry.
-	ListRelatedServices() []string
+	ListRelatedServices() []ServiceID
 }
 
-func canReadDiscoveryChain(entry discoveryChainConfigEntry, rule acl.Authorizer) bool {
-	return rule.ServiceRead(entry.GetName(), nil) == acl.Allow
+func canReadDiscoveryChain(entry discoveryChainConfigEntry, authz acl.Authorizer) bool {
+	var authzContext acl.AuthorizerContext
+	entry.GetEnterpriseMeta().FillAuthzContext(&authzContext)
+	return authz.ServiceRead(entry.GetName(), &authzContext) == acl.Allow
 }
 
 func canWriteDiscoveryChain(entry discoveryChainConfigEntry, rule acl.Authorizer) bool {
+	entryID := NewServiceID(entry.GetName(), entry.GetEnterpriseMeta())
+
+	var authzContext acl.AuthorizerContext
+	entryID.FillAuthzContext(&authzContext)
+
 	name := entry.GetName()
 
-	if rule.ServiceWrite(name, nil) != acl.Allow {
+	if rule.ServiceWrite(name, &authzContext) != acl.Allow {
 		return false
 	}
 
 	for _, svc := range entry.ListRelatedServices() {
-		if svc == name {
+		if entryID == svc {
 			continue
 		}
 
+		svc.FillAuthzContext(&authzContext)
 		// You only need read on related services to redirect traffic flow for
 		// your own service.
-		if rule.ServiceRead(svc, nil) != acl.Allow {
+		if rule.ServiceRead(svc.ID, &authzContext) != acl.Allow {
 			return false
 		}
 	}
@@ -919,46 +986,46 @@ func canWriteDiscoveryChain(entry discoveryChainConfigEntry, rule acl.Authorizer
 // DiscoveryChainConfigEntries wraps just the raw cross-referenced config
 // entries. None of these are defaulted.
 type DiscoveryChainConfigEntries struct {
-	Routers     map[string]*ServiceRouterConfigEntry
-	Splitters   map[string]*ServiceSplitterConfigEntry
-	Resolvers   map[string]*ServiceResolverConfigEntry
-	Services    map[string]*ServiceConfigEntry
+	Routers     map[ServiceID]*ServiceRouterConfigEntry
+	Splitters   map[ServiceID]*ServiceSplitterConfigEntry
+	Resolvers   map[ServiceID]*ServiceResolverConfigEntry
+	Services    map[ServiceID]*ServiceConfigEntry
 	GlobalProxy *ProxyConfigEntry
 }
 
 func NewDiscoveryChainConfigEntries() *DiscoveryChainConfigEntries {
 	return &DiscoveryChainConfigEntries{
-		Routers:   make(map[string]*ServiceRouterConfigEntry),
-		Splitters: make(map[string]*ServiceSplitterConfigEntry),
-		Resolvers: make(map[string]*ServiceResolverConfigEntry),
-		Services:  make(map[string]*ServiceConfigEntry),
+		Routers:   make(map[ServiceID]*ServiceRouterConfigEntry),
+		Splitters: make(map[ServiceID]*ServiceSplitterConfigEntry),
+		Resolvers: make(map[ServiceID]*ServiceResolverConfigEntry),
+		Services:  make(map[ServiceID]*ServiceConfigEntry),
 	}
 }
 
-func (e *DiscoveryChainConfigEntries) GetRouter(name string) *ServiceRouterConfigEntry {
+func (e *DiscoveryChainConfigEntries) GetRouter(sid ServiceID) *ServiceRouterConfigEntry {
 	if e.Routers != nil {
-		return e.Routers[name]
+		return e.Routers[sid]
 	}
 	return nil
 }
 
-func (e *DiscoveryChainConfigEntries) GetSplitter(name string) *ServiceSplitterConfigEntry {
+func (e *DiscoveryChainConfigEntries) GetSplitter(sid ServiceID) *ServiceSplitterConfigEntry {
 	if e.Splitters != nil {
-		return e.Splitters[name]
+		return e.Splitters[sid]
 	}
 	return nil
 }
 
-func (e *DiscoveryChainConfigEntries) GetResolver(name string) *ServiceResolverConfigEntry {
+func (e *DiscoveryChainConfigEntries) GetResolver(sid ServiceID) *ServiceResolverConfigEntry {
 	if e.Resolvers != nil {
-		return e.Resolvers[name]
+		return e.Resolvers[sid]
 	}
 	return nil
 }
 
-func (e *DiscoveryChainConfigEntries) GetService(name string) *ServiceConfigEntry {
+func (e *DiscoveryChainConfigEntries) GetService(sid ServiceID) *ServiceConfigEntry {
 	if e.Services != nil {
-		return e.Services[name]
+		return e.Services[sid]
 	}
 	return nil
 }
@@ -966,40 +1033,40 @@ func (e *DiscoveryChainConfigEntries) GetService(name string) *ServiceConfigEntr
 // AddRouters adds router configs. Convenience function for testing.
 func (e *DiscoveryChainConfigEntries) AddRouters(entries ...*ServiceRouterConfigEntry) {
 	if e.Routers == nil {
-		e.Routers = make(map[string]*ServiceRouterConfigEntry)
+		e.Routers = make(map[ServiceID]*ServiceRouterConfigEntry)
 	}
 	for _, entry := range entries {
-		e.Routers[entry.Name] = entry
+		e.Routers[NewServiceID(entry.Name, &entry.EnterpriseMeta)] = entry
 	}
 }
 
 // AddSplitters adds splitter configs. Convenience function for testing.
 func (e *DiscoveryChainConfigEntries) AddSplitters(entries ...*ServiceSplitterConfigEntry) {
 	if e.Splitters == nil {
-		e.Splitters = make(map[string]*ServiceSplitterConfigEntry)
+		e.Splitters = make(map[ServiceID]*ServiceSplitterConfigEntry)
 	}
 	for _, entry := range entries {
-		e.Splitters[entry.Name] = entry
+		e.Splitters[NewServiceID(entry.Name, entry.GetEnterpriseMeta())] = entry
 	}
 }
 
 // AddResolvers adds resolver configs. Convenience function for testing.
 func (e *DiscoveryChainConfigEntries) AddResolvers(entries ...*ServiceResolverConfigEntry) {
 	if e.Resolvers == nil {
-		e.Resolvers = make(map[string]*ServiceResolverConfigEntry)
+		e.Resolvers = make(map[ServiceID]*ServiceResolverConfigEntry)
 	}
 	for _, entry := range entries {
-		e.Resolvers[entry.Name] = entry
+		e.Resolvers[NewServiceID(entry.Name, entry.GetEnterpriseMeta())] = entry
 	}
 }
 
 // AddServices adds service configs. Convenience function for testing.
 func (e *DiscoveryChainConfigEntries) AddServices(entries ...*ServiceConfigEntry) {
 	if e.Services == nil {
-		e.Services = make(map[string]*ServiceConfigEntry)
+		e.Services = make(map[ServiceID]*ServiceConfigEntry)
 	}
 	for _, entry := range entries {
-		e.Services[entry.Name] = entry
+		e.Services[NewServiceID(entry.Name, entry.GetEnterpriseMeta())] = entry
 	}
 }
 
@@ -1137,4 +1204,11 @@ func validateServiceSubset(subset string) error {
 		return fmt.Errorf("must be 63 characters or fewer, begin or end with lower case alphanumeric characters, and contain lower case alphanumeric characters or '-' in between")
 	}
 	return nil
+}
+
+func defaultIfEmpty(val, defaultVal string) string {
+	if val != "" {
+		return val
+	}
+	return defaultVal
 }

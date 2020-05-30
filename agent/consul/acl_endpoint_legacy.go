@@ -24,6 +24,10 @@ func (a *ACL) Bootstrap(args *structs.DCSpecificRequest, reply *structs.ACL) err
 		return acl.ErrDisabled
 	}
 
+	if err := a.srv.aclBootstrapAllowed(); err != nil {
+		return err
+	}
+
 	// By doing some pre-checks we can head off later bootstrap attempts
 	// without having to run them through Raft, which should curb abuse.
 	state := a.srv.fsm.State()
@@ -65,10 +69,10 @@ func (a *ACL) Bootstrap(args *structs.DCSpecificRequest, reply *structs.ACL) err
 	default:
 		// Just log this, since it looks like the bootstrap may have
 		// completed.
-		a.srv.logger.Printf("[ERR] consul.acl: Unexpected response during bootstrap: %T", v)
+		a.logger.Error("Unexpected response during bootstrap", "type", fmt.Sprintf("%T", v))
 	}
 
-	a.srv.logger.Printf("[INFO] consul.acl: ACL bootstrap completed")
+	a.logger.Info("ACL bootstrap completed")
 	return nil
 }
 
@@ -94,7 +98,7 @@ func aclApplyInternal(srv *Server, args *structs.ACLRequest, reply *string) erro
 		}
 
 		// No need to check expiration times as those did not exist in legacy tokens.
-		_, existing, _ := srv.fsm.State().ACLTokenGetBySecret(nil, args.ACL.ID)
+		_, existing, _ := srv.fsm.State().ACLTokenGetBySecret(nil, args.ACL.ID, nil)
 		if existing != nil && existing.UsesNonLegacyFields() {
 			return fmt.Errorf("Cannot use legacy endpoint to modify a non-legacy token")
 		}
@@ -114,7 +118,7 @@ func aclApplyInternal(srv *Server, args *structs.ACLRequest, reply *string) erro
 		}
 
 		// Validate the rules compile
-		_, err := acl.NewPolicyFromSource("", 0, args.ACL.Rules, acl.SyntaxLegacy, srv.enterpriseACLConfig)
+		_, err := acl.NewPolicyFromSource("", 0, args.ACL.Rules, acl.SyntaxLegacy, srv.aclConfig, nil)
 		if err != nil {
 			return fmt.Errorf("ACL rule compilation failed: %v", err)
 		}
@@ -131,7 +135,7 @@ func aclApplyInternal(srv *Server, args *structs.ACLRequest, reply *string) erro
 	// Apply the update
 	resp, err := srv.raftApply(structs.ACLRequestType, args)
 	if err != nil {
-		srv.logger.Printf("[ERR] consul.acl: Apply failed: %v", err)
+		srv.logger.Error("Raft apply failed", "acl_op", args.Op, "error", err)
 		return err
 	}
 	if respErr, ok := resp.(error); ok {
@@ -186,7 +190,7 @@ func (a *ACL) Apply(args *structs.ACLRequest, reply *string) error {
 
 	// Clear the cache if applicable
 	if args.ACL.ID != "" {
-		a.srv.acls.cache.RemoveIdentity(args.ACL.ID)
+		a.srv.acls.cache.RemoveIdentity(tokenSecretCacheID(args.ACL.ID))
 	}
 
 	return nil
@@ -211,7 +215,7 @@ func (a *ACL) Get(args *structs.ACLSpecificRequest,
 	return a.srv.blockingQuery(&args.QueryOptions,
 		&reply.QueryMeta,
 		func(ws memdb.WatchSet, state *state.Store) error {
-			index, token, err := state.ACLTokenGetBySecret(ws, args.ACL)
+			index, token, err := state.ACLTokenGetBySecret(ws, args.ACL, nil)
 			if err != nil {
 				return err
 			}
@@ -262,7 +266,7 @@ func (a *ACL) List(args *structs.DCSpecificRequest,
 	return a.srv.blockingQuery(&args.QueryOptions,
 		&reply.QueryMeta,
 		func(ws memdb.WatchSet, state *state.Store) error {
-			index, tokens, err := state.ACLTokenList(ws, false, true, "", "", "")
+			index, tokens, err := state.ACLTokenList(ws, false, true, "", "", "", nil, nil)
 			if err != nil {
 				return err
 			}

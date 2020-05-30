@@ -28,6 +28,7 @@ func TestCompile(t *testing.T) {
 		"router with defaults and resolver":                testcase_RouterWithDefaults_NoSplit_WithResolver(),
 		"router with defaults and noop split":              testcase_RouterWithDefaults_WithNoopSplit_DefaultResolver(),
 		"router with defaults and noop split and resolver": testcase_RouterWithDefaults_WithNoopSplit_WithResolver(),
+		"router with no destination":                       testcase_JustRouterWithNoDestination(),
 		"route bypasses splitter":                          testcase_RouteBypassesSplit(),
 		"noop split":                                       testcase_NoopSplit_DefaultResolver(),
 		"noop split with protocol from proxy defaults":     testcase_NoopSplit_DefaultResolver_ProtocolFromProxyDefaults(),
@@ -154,14 +155,76 @@ func testcase_JustRouterWithDefaults() compileTestCase {
 
 	expect := &structs.CompiledDiscoveryChain{
 		Protocol:  "http",
-		StartNode: "router:main",
+		StartNode: "router:main.default",
 		Nodes: map[string]*structs.DiscoveryGraphNode{
-			"router:main": &structs.DiscoveryGraphNode{
+			"router:main.default": &structs.DiscoveryGraphNode{
 				Type: structs.DiscoveryGraphNodeTypeRouter,
-				Name: "main",
+				Name: "main.default",
 				Routes: []*structs.DiscoveryRoute{
 					{
-						Definition: newDefaultServiceRoute("main"),
+						Definition: newDefaultServiceRoute("main", "default"),
+						NextNode:   "resolver:main.default.dc1",
+					},
+				},
+			},
+			"resolver:main.default.dc1": &structs.DiscoveryGraphNode{
+				Type: structs.DiscoveryGraphNodeTypeResolver,
+				Name: "main.default.dc1",
+				Resolver: &structs.DiscoveryResolver{
+					Default:        true,
+					ConnectTimeout: 5 * time.Second,
+					Target:         "main.default.dc1",
+				},
+			},
+		},
+		Targets: map[string]*structs.DiscoveryTarget{
+			"main.default.dc1": newTarget("main", "", "default", "dc1", nil),
+		},
+	}
+
+	return compileTestCase{entries: entries, expect: expect}
+}
+
+func testcase_JustRouterWithNoDestination() compileTestCase {
+	entries := newEntries()
+	setServiceProtocol(entries, "main", "http")
+
+	entries.AddRouters(
+		&structs.ServiceRouterConfigEntry{
+			Kind: "service-router",
+			Name: "main",
+			Routes: []structs.ServiceRoute{
+				{
+					Match: &structs.ServiceRouteMatch{
+						HTTP: &structs.ServiceRouteHTTPMatch{
+							PathPrefix: "/",
+						},
+					},
+				},
+			},
+		},
+	)
+
+	expect := &structs.CompiledDiscoveryChain{
+		Protocol:  "http",
+		StartNode: "router:main.default",
+		Nodes: map[string]*structs.DiscoveryGraphNode{
+			"router:main.default": &structs.DiscoveryGraphNode{
+				Type: structs.DiscoveryGraphNodeTypeRouter,
+				Name: "main.default",
+				Routes: []*structs.DiscoveryRoute{
+					{
+						Definition: &structs.ServiceRoute{
+							Match: &structs.ServiceRouteMatch{
+								HTTP: &structs.ServiceRouteHTTPMatch{
+									PathPrefix: "/",
+								},
+							},
+						},
+						NextNode: "resolver:main.default.dc1",
+					},
+					{
+						Definition: newDefaultServiceRoute("main", "default"),
 						NextNode:   "resolver:main.default.dc1",
 					},
 				},
@@ -204,14 +267,14 @@ func testcase_RouterWithDefaults_NoSplit_WithResolver() compileTestCase {
 
 	expect := &structs.CompiledDiscoveryChain{
 		Protocol:  "http",
-		StartNode: "router:main",
+		StartNode: "router:main.default",
 		Nodes: map[string]*structs.DiscoveryGraphNode{
-			"router:main": &structs.DiscoveryGraphNode{
+			"router:main.default": &structs.DiscoveryGraphNode{
 				Type: structs.DiscoveryGraphNodeTypeRouter,
-				Name: "main",
+				Name: "main.default",
 				Routes: []*structs.DiscoveryRoute{
 					{
-						Definition: newDefaultServiceRoute("main"),
+						Definition: newDefaultServiceRoute("main", "default"),
 						NextNode:   "resolver:main.default.dc1",
 					},
 				},
@@ -255,21 +318,21 @@ func testcase_RouterWithDefaults_WithNoopSplit_DefaultResolver() compileTestCase
 
 	expect := &structs.CompiledDiscoveryChain{
 		Protocol:  "http",
-		StartNode: "router:main",
+		StartNode: "router:main.default",
 		Nodes: map[string]*structs.DiscoveryGraphNode{
-			"router:main": &structs.DiscoveryGraphNode{
+			"router:main.default": &structs.DiscoveryGraphNode{
 				Type: structs.DiscoveryGraphNodeTypeRouter,
-				Name: "main",
+				Name: "main.default",
 				Routes: []*structs.DiscoveryRoute{
 					{
-						Definition: newDefaultServiceRoute("main"),
-						NextNode:   "splitter:main",
+						Definition: newDefaultServiceRoute("main", "default"),
+						NextNode:   "splitter:main.default",
 					},
 				},
 			},
-			"splitter:main": &structs.DiscoveryGraphNode{
+			"splitter:main.default": &structs.DiscoveryGraphNode{
 				Type: structs.DiscoveryGraphNodeTypeSplitter,
-				Name: "main",
+				Name: "main.default",
 				Splits: []*structs.DiscoverySplit{
 					{
 						Weight:   100,
@@ -317,21 +380,21 @@ func testcase_NoopSplit_DefaultResolver_ProtocolFromProxyDefaults() compileTestC
 
 	expect := &structs.CompiledDiscoveryChain{
 		Protocol:  "http",
-		StartNode: "router:main",
+		StartNode: "router:main.default",
 		Nodes: map[string]*structs.DiscoveryGraphNode{
-			"router:main": &structs.DiscoveryGraphNode{
+			"router:main.default": &structs.DiscoveryGraphNode{
 				Type: structs.DiscoveryGraphNodeTypeRouter,
-				Name: "main",
+				Name: "main.default",
 				Routes: []*structs.DiscoveryRoute{
 					{
-						Definition: newDefaultServiceRoute("main"),
-						NextNode:   "splitter:main",
+						Definition: newDefaultServiceRoute("main", "default"),
+						NextNode:   "splitter:main.default",
 					},
 				},
 			},
-			"splitter:main": &structs.DiscoveryGraphNode{
+			"splitter:main.default": &structs.DiscoveryGraphNode{
 				Type: structs.DiscoveryGraphNodeTypeSplitter,
-				Name: "main",
+				Name: "main.default",
 				Splits: []*structs.DiscoverySplit{
 					{
 						Weight:   100,
@@ -386,21 +449,21 @@ func testcase_RouterWithDefaults_WithNoopSplit_WithResolver() compileTestCase {
 
 	expect := &structs.CompiledDiscoveryChain{
 		Protocol:  "http",
-		StartNode: "router:main",
+		StartNode: "router:main.default",
 		Nodes: map[string]*structs.DiscoveryGraphNode{
-			"router:main": &structs.DiscoveryGraphNode{
+			"router:main.default": &structs.DiscoveryGraphNode{
 				Type: structs.DiscoveryGraphNodeTypeRouter,
-				Name: "main",
+				Name: "main.default",
 				Routes: []*structs.DiscoveryRoute{
 					{
-						Definition: newDefaultServiceRoute("main"),
-						NextNode:   "splitter:main",
+						Definition: newDefaultServiceRoute("main", "default"),
+						NextNode:   "splitter:main.default",
 					},
 				},
 			},
-			"splitter:main": &structs.DiscoveryGraphNode{
+			"splitter:main.default": &structs.DiscoveryGraphNode{
 				Type: structs.DiscoveryGraphNodeTypeSplitter,
-				Name: "main",
+				Name: "main.default",
 				Splits: []*structs.DiscoverySplit{
 					{
 						Weight:   100,
@@ -463,22 +526,22 @@ func testcase_RouteBypassesSplit() compileTestCase {
 		},
 	)
 
-	router := entries.GetRouter("main")
+	router := entries.GetRouter(structs.NewServiceID("main", nil))
 
 	expect := &structs.CompiledDiscoveryChain{
 		Protocol:  "http",
-		StartNode: "router:main",
+		StartNode: "router:main.default",
 		Nodes: map[string]*structs.DiscoveryGraphNode{
-			"router:main": &structs.DiscoveryGraphNode{
+			"router:main.default": &structs.DiscoveryGraphNode{
 				Type: structs.DiscoveryGraphNodeTypeRouter,
-				Name: "main",
+				Name: "main.default",
 				Routes: []*structs.DiscoveryRoute{
 					{
 						Definition: &router.Routes[0],
 						NextNode:   "resolver:bypass.other.default.dc1",
 					},
 					{
-						Definition: newDefaultServiceRoute("main"),
+						Definition: newDefaultServiceRoute("main", "default"),
 						NextNode:   "resolver:main.default.dc1",
 					},
 				},
@@ -530,11 +593,11 @@ func testcase_NoopSplit_DefaultResolver() compileTestCase {
 
 	expect := &structs.CompiledDiscoveryChain{
 		Protocol:  "http",
-		StartNode: "splitter:main",
+		StartNode: "splitter:main.default",
 		Nodes: map[string]*structs.DiscoveryGraphNode{
-			"splitter:main": &structs.DiscoveryGraphNode{
+			"splitter:main.default": &structs.DiscoveryGraphNode{
 				Type: structs.DiscoveryGraphNodeTypeSplitter,
-				Name: "main",
+				Name: "main.default",
 				Splits: []*structs.DiscoverySplit{
 					{
 						Weight:   100,
@@ -583,11 +646,11 @@ func testcase_NoopSplit_WithResolver() compileTestCase {
 
 	expect := &structs.CompiledDiscoveryChain{
 		Protocol:  "http",
-		StartNode: "splitter:main",
+		StartNode: "splitter:main.default",
 		Nodes: map[string]*structs.DiscoveryGraphNode{
-			"splitter:main": &structs.DiscoveryGraphNode{
+			"splitter:main.default": &structs.DiscoveryGraphNode{
 				Type: structs.DiscoveryGraphNodeTypeSplitter,
-				Name: "main",
+				Name: "main.default",
 				Splits: []*structs.DiscoverySplit{
 					{
 						Weight:   100,
@@ -643,11 +706,11 @@ func testcase_SubsetSplit() compileTestCase {
 
 	expect := &structs.CompiledDiscoveryChain{
 		Protocol:  "http",
-		StartNode: "splitter:main",
+		StartNode: "splitter:main.default",
 		Nodes: map[string]*structs.DiscoveryGraphNode{
-			"splitter:main": &structs.DiscoveryGraphNode{
+			"splitter:main.default": &structs.DiscoveryGraphNode{
 				Type: structs.DiscoveryGraphNodeTypeSplitter,
-				Name: "main",
+				Name: "main.default",
 				Splits: []*structs.DiscoverySplit{
 					{
 						Weight:   60,
@@ -712,11 +775,11 @@ func testcase_ServiceSplit() compileTestCase {
 
 	expect := &structs.CompiledDiscoveryChain{
 		Protocol:  "http",
-		StartNode: "splitter:main",
+		StartNode: "splitter:main.default",
 		Nodes: map[string]*structs.DiscoveryGraphNode{
-			"splitter:main": &structs.DiscoveryGraphNode{
+			"splitter:main.default": &structs.DiscoveryGraphNode{
 				Type: structs.DiscoveryGraphNodeTypeSplitter,
-				Name: "main",
+				Name: "main.default",
 				Splits: []*structs.DiscoverySplit{
 					{
 						Weight:   60,
@@ -801,11 +864,11 @@ func testcase_SplitBypassesSplit() compileTestCase {
 
 	expect := &structs.CompiledDiscoveryChain{
 		Protocol:  "http",
-		StartNode: "splitter:main",
+		StartNode: "splitter:main.default",
 		Nodes: map[string]*structs.DiscoveryGraphNode{
-			"splitter:main": &structs.DiscoveryGraphNode{
+			"splitter:main.default": &structs.DiscoveryGraphNode{
 				Type: structs.DiscoveryGraphNodeTypeSplitter,
-				Name: "main",
+				Name: "main.default",
 				Splits: []*structs.DiscoverySplit{
 					{
 						Weight:   100,
@@ -1278,11 +1341,11 @@ func testcase_NoopSplit_WithDefaultSubset() compileTestCase {
 
 	expect := &structs.CompiledDiscoveryChain{
 		Protocol:  "http",
-		StartNode: "splitter:main",
+		StartNode: "splitter:main.default",
 		Nodes: map[string]*structs.DiscoveryGraphNode{
-			"splitter:main": &structs.DiscoveryGraphNode{
+			"splitter:main.default": &structs.DiscoveryGraphNode{
 				Type: structs.DiscoveryGraphNodeTypeSplitter,
-				Name: "main",
+				Name: "main.default",
 				Splits: []*structs.DiscoverySplit{
 					{
 						Weight:   100,
@@ -1586,11 +1649,11 @@ func testcase_MultiDatacenterCanary() compileTestCase {
 
 	expect := &structs.CompiledDiscoveryChain{
 		Protocol:  "http",
-		StartNode: "splitter:main",
+		StartNode: "splitter:main.default",
 		Nodes: map[string]*structs.DiscoveryGraphNode{
-			"splitter:main": &structs.DiscoveryGraphNode{
+			"splitter:main.default": &structs.DiscoveryGraphNode{
 				Type: structs.DiscoveryGraphNodeTypeSplitter,
-				Name: "main",
+				Name: "main.default",
 				Splits: []*structs.DiscoverySplit{
 					{
 						Weight:   60,
@@ -1712,16 +1775,16 @@ func testcase_AllBellsAndWhistles() compileTestCase {
 	)
 
 	var (
-		router = entries.GetRouter("main")
+		router = entries.GetRouter(structs.NewServiceID("main", nil))
 	)
 
 	expect := &structs.CompiledDiscoveryChain{
 		Protocol:  "http",
-		StartNode: "router:main",
+		StartNode: "router:main.default",
 		Nodes: map[string]*structs.DiscoveryGraphNode{
-			"router:main": &structs.DiscoveryGraphNode{
+			"router:main.default": &structs.DiscoveryGraphNode{
 				Type: structs.DiscoveryGraphNodeTypeRouter,
-				Name: "main",
+				Name: "main.default",
 				Routes: []*structs.DiscoveryRoute{
 					{
 						Definition: &router.Routes[0],
@@ -1729,17 +1792,17 @@ func testcase_AllBellsAndWhistles() compileTestCase {
 					},
 					{
 						Definition: &router.Routes[1],
-						NextNode:   "splitter:svc-split",
+						NextNode:   "splitter:svc-split.default",
 					},
 					{
-						Definition: newDefaultServiceRoute("main"),
+						Definition: newDefaultServiceRoute("main", "default"),
 						NextNode:   "resolver:default-subset.main.default.dc1",
 					},
 				},
 			},
-			"splitter:svc-split": &structs.DiscoveryGraphNode{
+			"splitter:svc-split.default": &structs.DiscoveryGraphNode{
 				Type: structs.DiscoveryGraphNodeTypeSplitter,
-				Name: "svc-split",
+				Name: "svc-split.default",
 				Splits: []*structs.DiscoverySplit{
 					{
 						Weight:   60,
@@ -2191,9 +2254,9 @@ func setServiceProtocol(entries *structs.DiscoveryChainConfigEntries, name, prot
 
 func newEntries() *structs.DiscoveryChainConfigEntries {
 	return &structs.DiscoveryChainConfigEntries{
-		Routers:   make(map[string]*structs.ServiceRouterConfigEntry),
-		Splitters: make(map[string]*structs.ServiceSplitterConfigEntry),
-		Resolvers: make(map[string]*structs.ServiceResolverConfigEntry),
+		Routers:   make(map[structs.ServiceID]*structs.ServiceRouterConfigEntry),
+		Splitters: make(map[structs.ServiceID]*structs.ServiceSplitterConfigEntry),
+		Resolvers: make(map[structs.ServiceID]*structs.ServiceResolverConfigEntry),
 	}
 }
 

@@ -7,22 +7,34 @@ export default Route.extend({
   repo: service('repository/service'),
   proxyRepo: service('repository/proxy'),
   model: function(params) {
-    const repo = this.repo;
-    const proxyRepo = this.proxyRepo;
     const dc = this.modelFor('dc').dc.Name;
+    const nspace = this.modelFor('nspace').nspace.substr(1);
     return hash({
-      item: repo.findInstanceBySlug(params.id, params.node, params.name, dc),
-    }).then(function(model) {
+      item: this.repo.findInstanceBySlug(params.id, params.node, params.name, dc, nspace),
+    }).then(model => {
       // this will not be run in a blocking loop, but this is ok as
       // its highly unlikely that a service will suddenly change to being a
       // connect-proxy or vice versa so leave as is for now
       return hash({
-        proxy:
+        proxyMeta:
           // proxies and mesh-gateways can't have proxies themselves so don't even look
           ['connect-proxy', 'mesh-gateway'].includes(get(model.item, 'Kind'))
             ? null
-            : proxyRepo.findInstanceBySlug(params.id, params.node, params.name, dc),
+            : this.proxyRepo.findInstanceBySlug(params.id, params.node, params.name, dc, nspace),
         ...model,
+      }).then(model => {
+        if (typeof get(model, 'proxyMeta.ServiceID') === 'undefined') {
+          return model;
+        }
+        const proxyName = get(model, 'proxyMeta.ServiceName');
+        const proxyID = get(model, 'proxyMeta.ServiceID');
+        const proxyNode = get(model, 'proxyMeta.Node');
+        return hash({
+          // Proxies have identical dc/nspace as their parent instance
+          // No need to use Proxy's dc/nspace response
+          proxy: this.repo.findInstanceBySlug(proxyID, proxyNode, proxyName, dc, nspace),
+          ...model,
+        });
       });
     });
   },

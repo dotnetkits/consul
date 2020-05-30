@@ -4,23 +4,23 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"log"
 	"net"
 	"net/http"
 	"os"
 	osexec "os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/sdk/testutil"
+	"github.com/hashicorp/go-hclog"
 
 	"github.com/armon/circbuf"
 	"github.com/hashicorp/consul/agent/exec"
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/lib"
-	"github.com/hashicorp/consul/types"
 	"github.com/hashicorp/go-cleanhttp"
 )
 
@@ -31,7 +31,7 @@ const (
 	MinInterval = time.Second
 
 	// DefaultBufSize is the maximum size of the captured
-	// check output by defaut. Prevents an enormous buffer
+	// check output by default. Prevents an enormous buffer
 	// from being captured
 	DefaultBufSize = 4 * 1024 // 4KB
 
@@ -51,7 +51,7 @@ type RPC interface {
 // to notify when a check has a status update. The update
 // should take care to be idempotent.
 type CheckNotifier interface {
-	UpdateCheck(checkID types.CheckID, status, output string)
+	UpdateCheck(checkID structs.CheckID, status, output string)
 }
 
 // CheckMonitor is used to periodically invoke a script to
@@ -60,13 +60,13 @@ type CheckNotifier interface {
 // Supports failures_before_critical and success_before_passing.
 type CheckMonitor struct {
 	Notify        CheckNotifier
-	CheckID       types.CheckID
-	ServiceID     string
+	CheckID       structs.CheckID
+	ServiceID     structs.ServiceID
 	Script        string
 	ScriptArgs    []string
 	Interval      time.Duration
 	Timeout       time.Duration
-	Logger        *log.Logger
+	Logger        hclog.Logger
 	OutputMaxSize int
 	StatusHandler *StatusHandler
 
@@ -122,7 +122,10 @@ func (c *CheckMonitor) check() {
 		cmd, err = exec.Script(c.Script)
 	}
 	if err != nil {
-		c.Logger.Printf("[ERR] agent: Check %q failed to setup: %s", c.CheckID, err)
+		c.Logger.Error("Check failed to setup",
+			"check", c.CheckID.String(),
+			"error", err,
+		)
 		c.Notify.UpdateCheck(c.CheckID, api.HealthCritical, err.Error())
 		return
 	}
@@ -139,13 +142,19 @@ func (c *CheckMonitor) check() {
 			outputStr = fmt.Sprintf("Captured %d of %d bytes\n...\n%s",
 				output.Size(), output.TotalWritten(), outputStr)
 		}
-		c.Logger.Printf("[TRACE] agent: Check %q output: %s", c.CheckID, outputStr)
+		c.Logger.Trace("Check output",
+			"check", c.CheckID.String(),
+			"output", outputStr,
+		)
 		return outputStr
 	}
 
 	// Start the check
 	if err := cmd.Start(); err != nil {
-		c.Logger.Printf("[ERR] agent: Check %q failed to invoke: %s", c.CheckID, err)
+		c.Logger.Error("Check failed to invoke",
+			"check", c.CheckID.String(),
+			"error", err,
+		)
 		c.Notify.UpdateCheck(c.CheckID, api.HealthCritical, err.Error())
 		return
 	}
@@ -163,11 +172,17 @@ func (c *CheckMonitor) check() {
 	select {
 	case <-time.After(timeout):
 		if err := exec.KillCommandSubtree(cmd); err != nil {
-			c.Logger.Printf("[WARN] agent: Check %q failed to kill after timeout: %s", c.CheckID, err)
+			c.Logger.Warn("Check failed to kill after timeout",
+				"check", c.CheckID.String(),
+				"error", err,
+			)
 		}
 
 		msg := fmt.Sprintf("Timed out (%s) running check", timeout.String())
-		c.Logger.Printf("[WARN] agent: Check %q: %s", c.CheckID, msg)
+		c.Logger.Warn("Timed out running check",
+			"check", c.CheckID.String(),
+			"timeout", timeout.String(),
+		)
 
 		outputStr := truncateAndLogOutput()
 		if len(outputStr) > 0 {
@@ -213,10 +228,10 @@ func (c *CheckMonitor) check() {
 // automatically set to critical.
 type CheckTTL struct {
 	Notify    CheckNotifier
-	CheckID   types.CheckID
-	ServiceID string
+	CheckID   structs.CheckID
+	ServiceID structs.ServiceID
 	TTL       time.Duration
-	Logger    *log.Logger
+	Logger    hclog.Logger
 
 	timer *time.Timer
 
@@ -259,8 +274,9 @@ func (c *CheckTTL) run() {
 	for {
 		select {
 		case <-c.timer.C:
-			c.Logger.Printf("[WARN] agent: Check %q missed TTL, is now critical",
-				c.CheckID)
+			c.Logger.Warn("Check missed TTL, is now critical",
+				"check", c.CheckID.String(),
+			)
 			c.Notify.UpdateCheck(c.CheckID, api.HealthCritical, c.getExpiredOutput())
 
 		case <-c.stopCh:
@@ -286,7 +302,10 @@ func (c *CheckTTL) getExpiredOutput() string {
 // and to renew the TTL. If expired, TTL is restarted.
 // output is returned (might be truncated)
 func (c *CheckTTL) SetStatus(status, output string) string {
-	c.Logger.Printf("[DEBUG] agent: Check %q status is now %s", c.CheckID, status)
+	c.Logger.Debug("Check status updated",
+		"check", c.CheckID.String(),
+		"status", status,
+	)
 	total := len(output)
 	if total > c.OutputMaxSize {
 		output = fmt.Sprintf("%s ... (captured %d of %d bytes)",
@@ -310,14 +329,15 @@ func (c *CheckTTL) SetStatus(status, output string) string {
 // or if the request returns an error
 // Supports failures_before_critical and success_before_passing.
 type CheckHTTP struct {
-	CheckID         types.CheckID
-	ServiceID       string
+	CheckID         structs.CheckID
+	ServiceID       structs.ServiceID
 	HTTP            string
 	Header          map[string][]string
 	Method          string
+	Body            string
 	Interval        time.Duration
 	Timeout         time.Duration
-	Logger          *log.Logger
+	Logger          hclog.Logger
 	TLSClientConfig *tls.Config
 	OutputMaxSize   int
 	StatusHandler   *StatusHandler
@@ -334,9 +354,10 @@ type CheckHTTP struct {
 
 func (c *CheckHTTP) CheckType() structs.CheckType {
 	return structs.CheckType{
-		CheckID:       c.CheckID,
+		CheckID:       c.CheckID.ID,
 		HTTP:          c.HTTP,
 		Method:        c.Method,
+		Body:          c.Body,
 		Header:        c.Header,
 		Interval:      c.Interval,
 		ProxyHTTP:     c.ProxyHTTP,
@@ -417,7 +438,8 @@ func (c *CheckHTTP) check() {
 		target = c.ProxyHTTP
 	}
 
-	req, err := http.NewRequest(method, target, nil)
+	bodyReader := strings.NewReader(c.Body)
+	req, err := http.NewRequest(method, target, bodyReader)
 	if err != nil {
 		c.StatusHandler.updateCheck(c.CheckID, api.HealthCritical, err.Error())
 		return
@@ -451,7 +473,10 @@ func (c *CheckHTTP) check() {
 	// Read the response into a circular buffer to limit the size
 	output, _ := circbuf.NewBuffer(int64(c.OutputMaxSize))
 	if _, err := io.Copy(output, resp.Body); err != nil {
-		c.Logger.Printf("[WARN] agent: Check %q error while reading body: %s", c.CheckID, err)
+		c.Logger.Warn("Check error while reading body",
+			"check", c.CheckID.String(),
+			"error", err,
+		)
 	}
 
 	// Format the response body
@@ -477,12 +502,12 @@ func (c *CheckHTTP) check() {
 // The check is critical if the connection returns an error
 // Supports failures_before_critical and success_before_passing.
 type CheckTCP struct {
-	CheckID       types.CheckID
-	ServiceID     string
+	CheckID       structs.CheckID
+	ServiceID     structs.ServiceID
 	TCP           string
 	Interval      time.Duration
 	Timeout       time.Duration
-	Logger        *log.Logger
+	Logger        hclog.Logger
 	StatusHandler *StatusHandler
 
 	dialer   *net.Dialer
@@ -543,7 +568,10 @@ func (c *CheckTCP) run() {
 func (c *CheckTCP) check() {
 	conn, err := c.dialer.Dial(`tcp`, c.TCP)
 	if err != nil {
-		c.Logger.Printf("[WARN] agent: Check %q socket connection failed: %s", c.CheckID, err)
+		c.Logger.Warn("Check socket connection failed",
+			"check", c.CheckID.String(),
+			"error", err,
+		)
 		c.StatusHandler.updateCheck(c.CheckID, api.HealthCritical, err.Error())
 		return
 	}
@@ -557,14 +585,14 @@ func (c *CheckTCP) check() {
 // with nagios plugins and expects the output in the same format.
 // Supports failures_before_critical and success_before_passing.
 type CheckDocker struct {
-	CheckID           types.CheckID
-	ServiceID         string
+	CheckID           structs.CheckID
+	ServiceID         structs.ServiceID
 	Script            string
 	ScriptArgs        []string
 	DockerContainerID string
 	Shell             string
 	Interval          time.Duration
-	Logger            *log.Logger
+	Logger            hclog.Logger
 	Client            *DockerClient
 	StatusHandler     *StatusHandler
 
@@ -577,7 +605,7 @@ func (c *CheckDocker) Start() {
 	}
 
 	if c.Logger == nil {
-		c.Logger = log.New(ioutil.Discard, "", 0)
+		c.Logger = testutil.NewDiscardLogger()
 	}
 
 	if c.Shell == "" {
@@ -616,7 +644,10 @@ func (c *CheckDocker) check() {
 	var out string
 	status, b, err := c.doCheck()
 	if err != nil {
-		c.Logger.Printf("[DEBUG] agent: Check %q: %s", c.CheckID, err)
+		c.Logger.Debug("Check failed",
+			"check", c.CheckID.String(),
+			"error", err,
+		)
 		out = err.Error()
 	} else {
 		// out is already limited to CheckBufSize since we're getting a
@@ -626,7 +657,10 @@ func (c *CheckDocker) check() {
 		if int(b.TotalWritten()) > len(out) {
 			out = fmt.Sprintf("Captured %d of %d bytes\n...\n%s", len(out), b.TotalWritten(), out)
 		}
-		c.Logger.Printf("[TRACE] agent: Check %q output: %s", c.CheckID, out)
+		c.Logger.Trace("Check output",
+			"check", c.CheckID.String(),
+			"output", out,
+		)
 	}
 	c.StatusHandler.updateCheck(c.CheckID, status, out)
 }
@@ -658,10 +692,16 @@ func (c *CheckDocker) doCheck() (string, *circbuf.Buffer, error) {
 	case 0:
 		return api.HealthPassing, buf, nil
 	case 1:
-		c.Logger.Printf("[DEBUG] agent: Check %q failed with exit code: %d", c.CheckID, exitCode)
+		c.Logger.Debug("Check failed",
+			"check", c.CheckID.String(),
+			"exit_code", exitCode,
+		)
 		return api.HealthWarning, buf, nil
 	default:
-		c.Logger.Printf("[DEBUG] agent: Check %q failed with exit code: %d", c.CheckID, exitCode)
+		c.Logger.Debug("Check failed",
+			"check", c.CheckID.String(),
+			"exit_code", exitCode,
+		)
 		return api.HealthCritical, buf, nil
 	}
 }
@@ -673,13 +713,13 @@ func (c *CheckDocker) doCheck() (string, *circbuf.Buffer, error) {
 // not SERVING.
 // Supports failures_before_critical and success_before_passing.
 type CheckGRPC struct {
-	CheckID         types.CheckID
-	ServiceID       string
+	CheckID         structs.CheckID
+	ServiceID       structs.ServiceID
 	GRPC            string
 	Interval        time.Duration
 	Timeout         time.Duration
 	TLSClientConfig *tls.Config
-	Logger          *log.Logger
+	Logger          hclog.Logger
 	StatusHandler   *StatusHandler
 
 	probe    *GrpcHealthProbe
@@ -694,7 +734,7 @@ type CheckGRPC struct {
 
 func (c *CheckGRPC) CheckType() structs.CheckType {
 	return structs.CheckType{
-		CheckID:   c.CheckID,
+		CheckID:   c.CheckID.ID,
 		GRPC:      c.GRPC,
 		ProxyGRPC: c.ProxyGRPC,
 		Interval:  c.Interval,
@@ -758,7 +798,7 @@ func (c *CheckGRPC) Stop() {
 // reaches the given threshold.
 type StatusHandler struct {
 	inner                  CheckNotifier
-	logger                 *log.Logger
+	logger                 hclog.Logger
 	successBeforePassing   int
 	successCounter         int
 	failuresBeforeCritical int
@@ -766,7 +806,7 @@ type StatusHandler struct {
 }
 
 // NewStatusHandler set counters values to threshold in order to immediatly update status after first check.
-func NewStatusHandler(inner CheckNotifier, logger *log.Logger, successBeforePassing, failuresBeforeCritical int) *StatusHandler {
+func NewStatusHandler(inner CheckNotifier, logger hclog.Logger, successBeforePassing, failuresBeforeCritical int) *StatusHandler {
 	return &StatusHandler{
 		logger:                 logger,
 		inner:                  inner,
@@ -777,25 +817,38 @@ func NewStatusHandler(inner CheckNotifier, logger *log.Logger, successBeforePass
 	}
 }
 
-func (s *StatusHandler) updateCheck(checkID types.CheckID, status, output string) {
+func (s *StatusHandler) updateCheck(checkID structs.CheckID, status, output string) {
 
 	if status == api.HealthPassing || status == api.HealthWarning {
 		s.successCounter++
 		s.failuresCounter = 0
 		if s.successCounter >= s.successBeforePassing {
-			s.logger.Printf("[DEBUG] agent: Check %q is %q", checkID, status)
+			s.logger.Debug("Check status updated",
+				"check", checkID.String(),
+				"status", status,
+			)
 			s.inner.UpdateCheck(checkID, status, output)
 			return
 		}
-		s.logger.Printf("[WARN] agent: Check %q was %q but has not reached success threshold %d/%d", checkID, status, s.successCounter, s.successBeforePassing)
+		s.logger.Warn("Check passed but has not reached success threshold",
+			"check", checkID.String(),
+			"status", status,
+			"success_count", s.successCounter,
+			"success_threshold", s.successBeforePassing,
+		)
 	} else {
 		s.failuresCounter++
 		s.successCounter = 0
 		if s.failuresCounter >= s.failuresBeforeCritical {
-			s.logger.Printf("[WARN] agent: Check %q is now critical", checkID)
+			s.logger.Warn("Check is now critical", "check", checkID.String())
 			s.inner.UpdateCheck(checkID, status, output)
 			return
 		}
-		s.logger.Printf("[WARN] agent: Check %q failed but has not reached failure threshold %d/%d", checkID, s.failuresCounter, s.failuresBeforeCritical)
+		s.logger.Warn("Check failed but has not reached failure threshold",
+			"check", checkID.String(),
+			"status", status,
+			"failure_count", s.failuresCounter,
+			"failure_threshold", s.failuresBeforeCritical,
+		)
 	}
 }

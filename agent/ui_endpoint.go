@@ -15,17 +15,27 @@ import (
 // to extract this.
 const metaExternalSource = "external-source"
 
+type GatewayConfig struct {
+	ListenerPort int
+}
+
 // ServiceSummary is used to summarize a service
 type ServiceSummary struct {
 	Kind              structs.ServiceKind `json:",omitempty"`
 	Name              string
 	Tags              []string
 	Nodes             []string
+	InstanceCount     int
+	ProxyFor          []string            `json:",omitempty"`
+	proxyForSet       map[string]struct{} // internal to track uniqueness
 	ChecksPassing     int
 	ChecksWarning     int
 	ChecksCritical    int
 	ExternalSources   []string
 	externalSourceSet map[string]struct{} // internal to track uniqueness
+	GatewayConfig     GatewayConfig       `json:",omitempty"`
+
+	structs.EnterpriseMeta
 }
 
 // UINodes is used to list the nodes in a given datacenter. We return a
@@ -36,6 +46,11 @@ func (s *HTTPServer) UINodes(resp http.ResponseWriter, req *http.Request) (inter
 	if done := s.parse(resp, req, &args.Datacenter, &args.QueryOptions); done {
 		return nil, nil
 	}
+
+	if err := s.parseEntMeta(req, &args.EnterpriseMeta); err != nil {
+		return nil, err
+	}
+
 	s.parseFilter(req, &args.Filter)
 
 	// Make the RPC request
@@ -73,6 +88,10 @@ func (s *HTTPServer) UINodeInfo(resp http.ResponseWriter, req *http.Request) (in
 	args := structs.NodeSpecificRequest{}
 	if done := s.parse(resp, req, &args.Datacenter, &args.QueryOptions); done {
 		return nil, nil
+	}
+
+	if err := s.parseEntMeta(req, &args.EnterpriseMeta); err != nil {
+		return nil, err
 	}
 
 	// Verify we have some DC, or use the default
@@ -121,6 +140,10 @@ func (s *HTTPServer) UIServices(resp http.ResponseWriter, req *http.Request) (in
 		return nil, nil
 	}
 
+	if err := s.parseEntMeta(req, &args.EnterpriseMeta); err != nil {
+		return nil, err
+	}
+
 	s.parseFilter(req, &args.Filter)
 
 	// Make the RPC request
@@ -137,17 +160,58 @@ RPC:
 	}
 
 	// Generate the summary
-	return summarizeServices(out.Nodes), nil
+	// TODO (gateways) (freddy) Have Internal.ServiceDump return ServiceDump instead. Need to add bexpr filtering for type.
+	return summarizeServices(out.Nodes.ToServiceDump()), nil
 }
 
-func summarizeServices(dump structs.CheckServiceNodes) []*ServiceSummary {
+// UIGatewayServices is used to query all the nodes for services associated with a gateway along with their gateway config
+func (s *HTTPServer) UIGatewayServicesNodes(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	// Parse arguments
+	args := structs.ServiceSpecificRequest{}
+	if err := s.parseEntMetaNoWildcard(req, &args.EnterpriseMeta); err != nil {
+		return nil, err
+	}
+	if done := s.parse(resp, req, &args.Datacenter, &args.QueryOptions); done {
+		return nil, nil
+	}
+
+	// Pull out the service name
+	args.ServiceName = strings.TrimPrefix(req.URL.Path, "/v1/internal/ui/gateway-services-nodes/")
+	if args.ServiceName == "" {
+		resp.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(resp, "Missing gateway name")
+		return nil, nil
+	}
+
+	// Make the RPC request
+	var out structs.IndexedServiceDump
+	defer setMeta(resp, &out.QueryMeta)
+RPC:
+	if err := s.agent.RPC("Internal.GatewayServiceDump", &args, &out); err != nil {
+		// Retry the request allowing stale data if no leader
+		if strings.Contains(err.Error(), structs.ErrNoLeader.Error()) && !args.AllowStale {
+			args.AllowStale = true
+			goto RPC
+		}
+		return nil, err
+	}
+	return summarizeServices(out.Dump), nil
+}
+
+func summarizeServices(dump structs.ServiceDump) []*ServiceSummary {
 	// Collect the summary information
-	var services []string
-	summary := make(map[string]*ServiceSummary)
-	getService := func(service string) *ServiceSummary {
+	var services []structs.ServiceID
+	summary := make(map[structs.ServiceID]*ServiceSummary)
+	getService := func(service structs.ServiceID) *ServiceSummary {
 		serv, ok := summary[service]
 		if !ok {
-			serv = &ServiceSummary{Name: service}
+			serv = &ServiceSummary{
+				Name:           service.ID,
+				EnterpriseMeta: service.EnterpriseMeta,
+				// the other code will increment this unconditionally so we
+				// shouldn't initialize it to 1
+				InstanceCount: 0,
+			}
 			summary[service] = serv
 			services = append(services, service)
 		}
@@ -155,10 +219,31 @@ func summarizeServices(dump structs.CheckServiceNodes) []*ServiceSummary {
 	}
 
 	for _, csn := range dump {
+		if csn.GatewayService != nil {
+			sum := getService(csn.GatewayService.Service)
+			sum.GatewayConfig.ListenerPort = csn.GatewayService.Port
+		}
+
+		// Will happen in cases where we only have the GatewayServices mapping
+		if csn.Service == nil {
+			continue
+		}
+		sid := structs.NewServiceID(csn.Service.Service, &csn.Service.EnterpriseMeta)
+		sum := getService(sid)
+
 		svc := csn.Service
-		sum := getService(svc.Service)
 		sum.Nodes = append(sum.Nodes, csn.Node.Node)
 		sum.Kind = svc.Kind
+		sum.InstanceCount += 1
+		if svc.Kind == structs.ServiceKindConnectProxy {
+			if _, ok := sum.proxyForSet[svc.Proxy.DestinationServiceName]; !ok {
+				if sum.proxyForSet == nil {
+					sum.proxyForSet = make(map[string]struct{})
+				}
+				sum.proxyForSet[svc.Proxy.DestinationServiceName] = struct{}{}
+				sum.ProxyFor = append(sum.ProxyFor, svc.Proxy.DestinationServiceName)
+			}
+		}
 		for _, tag := range svc.Tags {
 			found := false
 			for _, existing := range sum.Tags {
@@ -201,12 +286,15 @@ func summarizeServices(dump structs.CheckServiceNodes) []*ServiceSummary {
 	}
 
 	// Return the services in sorted order
-	sort.Strings(services)
+	sort.Slice(services, func(i, j int) bool {
+		return services[i].LessThan(&services[j])
+	})
 	output := make([]*ServiceSummary, len(summary))
 	for idx, service := range services {
-		// Sort the nodes
+		// Sort the nodes and tags
 		sum := summary[service]
 		sort.Strings(sum.Nodes)
+		sort.Strings(sum.Tags)
 		output[idx] = sum
 	}
 	return output

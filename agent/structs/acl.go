@@ -2,6 +2,7 @@ package structs
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/consul/acl"
+	"github.com/hashicorp/consul/lib"
 	"golang.org/x/crypto/blake2b"
 )
 
@@ -86,22 +88,6 @@ session_prefix "" {
 	ACLTokenAnonymousID = "00000000-0000-0000-0000-000000000002"
 
 	ACLReservedPrefix = "00000000-0000-0000-0000-0000000000"
-
-	// aclPolicyTemplateServiceIdentity is the template used for synthesizing
-	// policies for service identities.
-	aclPolicyTemplateServiceIdentity = `
-service "%s" {
-	policy = "write"
-}
-service "%s-sidecar-proxy" {
-	policy = "write"
-}
-service_prefix "" {
-	policy = "read"
-}
-node_prefix "" {
-	policy = "read"
-}`
 )
 
 func ACLIDReserved(id string) bool {
@@ -134,6 +120,8 @@ type ACLIdentity interface {
 	EmbeddedPolicy() *ACLPolicy
 	ServiceIdentityList() []*ACLServiceIdentity
 	IsExpired(asOf time.Time) bool
+	IsLocal() bool
+	EnterpriseMetadata() *EnterpriseMeta
 }
 
 type ACLTokenPolicyLink struct {
@@ -181,10 +169,10 @@ func (s *ACLServiceIdentity) EstimateSize() int {
 	return size
 }
 
-func (s *ACLServiceIdentity) SyntheticPolicy() *ACLPolicy {
+func (s *ACLServiceIdentity) SyntheticPolicy(entMeta *EnterpriseMeta) *ACLPolicy {
 	// Given that we validate this string name before persisting, we do not
 	// have to escape it before doing the following interpolation.
-	rules := fmt.Sprintf(aclPolicyTemplateServiceIdentity, s.ServiceName, s.ServiceName)
+	rules := aclServiceIdentityRules(s.ServiceName, entMeta)
 
 	hasher := fnv.New128a()
 	hashID := fmt.Sprintf("%x", hasher.Sum([]byte(rules)))
@@ -196,6 +184,7 @@ func (s *ACLServiceIdentity) SyntheticPolicy() *ACLPolicy {
 	policy.Rules = rules
 	policy.Syntax = acl.SyntaxCurrent
 	policy.Datacenters = s.Datacenters
+	policy.EnterpriseMeta.Merge(entMeta)
 	policy.SetHash(true)
 	return policy
 }
@@ -241,6 +230,9 @@ type ACLToken struct {
 	// AuthMethod is the name of the auth method used to create this token.
 	AuthMethod string `json:",omitempty"`
 
+	// ACLAuthMethodEnterpriseMeta is the EnterpriseMeta for the AuthMethod that this token was created from
+	ACLAuthMethodEnterpriseMeta
+
 	// ExpirationTime represents the point after which a token should be
 	// considered revoked and is eligible for destruction. The zero value
 	// represents NO expiration.
@@ -268,8 +260,41 @@ type ACLToken struct {
 	// unnecessary calls to the authoritative DC
 	Hash []byte
 
+	// Embedded Enterprise Metadata
+	EnterpriseMeta `mapstructure:",squash"`
+
 	// Embedded Raft Metadata
 	RaftIndex
+}
+
+func (t *ACLToken) UnmarshalJSON(data []byte) (err error) {
+	type Alias ACLToken
+	aux := &struct {
+		ExpirationTTL interface{}
+		Hash          string
+		*Alias
+	}{
+		Alias: (*Alias)(t),
+	}
+
+	if err = lib.UnmarshalJSON(data, &aux); err != nil {
+		return err
+	}
+	if aux.ExpirationTTL != nil {
+		switch v := aux.ExpirationTTL.(type) {
+		case string:
+			if t.ExpirationTTL, err = time.ParseDuration(v); err != nil {
+				return err
+			}
+		case float64:
+			t.ExpirationTTL = time.Duration(v)
+		}
+
+	}
+	if aux.Hash != "" {
+		t.Hash = []byte(aux.Hash)
+	}
+	return nil
 }
 
 func (t *ACLToken) Clone() *ACLToken {
@@ -346,6 +371,10 @@ func (t *ACLToken) IsExpired(asOf time.Time) bool {
 	return t.ExpirationTime.Before(asOf)
 }
 
+func (t *ACLToken) IsLocal() bool {
+	return t.Local
+}
+
 func (t *ACLToken) HasExpirationTime() bool {
 	return t.ExpirationTime != nil && !t.ExpirationTime.IsZero()
 }
@@ -390,6 +419,10 @@ func (t *ACLToken) EmbeddedPolicy() *ACLPolicy {
 	return policy
 }
 
+func (t *ACLToken) EnterpriseMetadata() *EnterpriseMeta {
+	return &t.EnterpriseMeta
+}
+
 func (t *ACLToken) SetHash(force bool) []byte {
 	if force || t.Hash == nil {
 		// Initialize a 256bit Blake2 hash (32 bytes)
@@ -429,6 +462,8 @@ func (t *ACLToken) SetHash(force bool) []byte {
 			srvid.AddToHash(hash)
 		}
 
+		t.EnterpriseMeta.addToHash(hash, false)
+
 		// Finalize the hash
 		hashVal := hash.Sum(nil)
 
@@ -450,7 +485,7 @@ func (t *ACLToken) EstimateSize() int {
 	for _, srvid := range t.ServiceIdentities {
 		size += srvid.EstimateSize()
 	}
-	return size
+	return size + t.EnterpriseMeta.estimateSize()
 }
 
 // ACLTokens is a slice of ACLTokens.
@@ -470,6 +505,7 @@ type ACLTokenListStub struct {
 	CreateIndex       uint64
 	ModifyIndex       uint64
 	Legacy            bool `json:",omitempty"`
+	EnterpriseMeta
 }
 
 type ACLTokenListStubs []*ACLTokenListStub
@@ -489,6 +525,7 @@ func (token *ACLToken) Stub() *ACLTokenListStub {
 		CreateIndex:       token.CreateIndex,
 		ModifyIndex:       token.ModifyIndex,
 		Legacy:            token.Rules != "",
+		EnterpriseMeta:    token.EnterpriseMeta,
 	}
 }
 
@@ -536,8 +573,29 @@ type ACLPolicy struct {
 	// unnecessary calls to the authoritative DC
 	Hash []byte
 
+	// Embedded Enterprise ACL Metadata
+	EnterpriseMeta `mapstructure:",squash"`
+
 	// Embedded Raft Metadata
 	RaftIndex `hash:"ignore"`
+}
+
+func (t *ACLPolicy) UnmarshalJSON(data []byte) error {
+	type Alias ACLPolicy
+	aux := &struct {
+		Hash string
+		*Alias
+	}{
+		Alias: (*Alias)(t),
+	}
+
+	if err := lib.UnmarshalJSON(data, &aux); err != nil {
+		return err
+	}
+	if aux.Hash != "" {
+		t.Hash = []byte(aux.Hash)
+	}
+	return nil
 }
 
 func (p *ACLPolicy) Clone() *ACLPolicy {
@@ -554,17 +612,19 @@ type ACLPolicyListStub struct {
 	Hash        []byte
 	CreateIndex uint64
 	ModifyIndex uint64
+	EnterpriseMeta
 }
 
 func (p *ACLPolicy) Stub() *ACLPolicyListStub {
 	return &ACLPolicyListStub{
-		ID:          p.ID,
-		Name:        p.Name,
-		Description: p.Description,
-		Datacenters: p.Datacenters,
-		Hash:        p.Hash,
-		CreateIndex: p.CreateIndex,
-		ModifyIndex: p.ModifyIndex,
+		ID:             p.ID,
+		Name:           p.Name,
+		Description:    p.Description,
+		Datacenters:    p.Datacenters,
+		Hash:           p.Hash,
+		CreateIndex:    p.CreateIndex,
+		ModifyIndex:    p.ModifyIndex,
+		EnterpriseMeta: p.EnterpriseMeta,
 	}
 }
 
@@ -595,6 +655,8 @@ func (p *ACLPolicy) SetHash(force bool) []byte {
 			hash.Write([]byte(dc))
 		}
 
+		p.EnterpriseMeta.addToHash(hash, false)
+
 		// Finalize the hash
 		hashVal := hash.Sum(nil)
 
@@ -614,7 +676,7 @@ func (p *ACLPolicy) EstimateSize() int {
 		size += len(dc)
 	}
 
-	return size
+	return size + p.EnterpriseMeta.estimateSize()
 }
 
 // HashKey returns a consistent hash for a set of policies.
@@ -644,7 +706,7 @@ func (policies ACLPolicyListStubs) Sort() {
 	})
 }
 
-func (policies ACLPolicies) resolveWithCache(cache *ACLCaches, entConf *acl.EnterpriseACLConfig) ([]*acl.Policy, error) {
+func (policies ACLPolicies) resolveWithCache(cache *ACLCaches, entConf *acl.Config) ([]*acl.Policy, error) {
 	// Parse the policies
 	parsed := make([]*acl.Policy, 0, len(policies))
 	for _, policy := range policies {
@@ -657,7 +719,7 @@ func (policies ACLPolicies) resolveWithCache(cache *ACLCaches, entConf *acl.Ente
 			continue
 		}
 
-		p, err := acl.NewPolicyFromSource(policy.ID, policy.ModifyIndex, policy.Rules, policy.Syntax, entConf)
+		p, err := acl.NewPolicyFromSource(policy.ID, policy.ModifyIndex, policy.Rules, policy.Syntax, entConf, policy.EnterprisePolicyMeta())
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse %q: %v", policy.Name, err)
 		}
@@ -669,7 +731,7 @@ func (policies ACLPolicies) resolveWithCache(cache *ACLCaches, entConf *acl.Ente
 	return parsed, nil
 }
 
-func (policies ACLPolicies) Compile(parent acl.Authorizer, cache *ACLCaches, entConf *acl.EnterpriseACLConfig) (acl.Authorizer, error) {
+func (policies ACLPolicies) Compile(cache *ACLCaches, entConf *acl.Config) (acl.Authorizer, error) {
 	// Determine the cache key
 	cacheKey := policies.HashKey()
 	entry := cache.GetAuthorizer(cacheKey)
@@ -684,7 +746,7 @@ func (policies ACLPolicies) Compile(parent acl.Authorizer, cache *ACLCaches, ent
 	}
 
 	// Create the ACL object
-	authorizer, err := acl.NewPolicyAuthorizerWithDefaults(parent, parsed, entConf)
+	authorizer, err := acl.NewPolicyAuthorizer(parsed, entConf)
 	if err != nil {
 		return nil, fmt.Errorf("failed to construct ACL Authorizer: %v", err)
 	}
@@ -694,7 +756,7 @@ func (policies ACLPolicies) Compile(parent acl.Authorizer, cache *ACLCaches, ent
 	return authorizer, nil
 }
 
-func (policies ACLPolicies) Merge(cache *ACLCaches, entConf *acl.EnterpriseACLConfig) (*acl.Policy, error) {
+func (policies ACLPolicies) Merge(cache *ACLCaches, entConf *acl.Config) (*acl.Policy, error) {
 	parsed, err := policies.resolveWithCache(cache, entConf)
 	if err != nil {
 		return nil, err
@@ -758,8 +820,29 @@ type ACLRole struct {
 	// unnecessary calls to the authoritative DC
 	Hash []byte
 
+	// Embedded Enterprise ACL metadata
+	EnterpriseMeta `mapstructure:",squash"`
+
 	// Embedded Raft Metadata
 	RaftIndex `hash:"ignore"`
+}
+
+func (t *ACLRole) UnmarshalJSON(data []byte) error {
+	type Alias ACLRole
+	aux := &struct {
+		Hash string
+		*Alias
+	}{
+		Alias: (*Alias)(t),
+	}
+
+	if err := lib.UnmarshalJSON(data, &aux); err != nil {
+		return err
+	}
+	if aux.Hash != "" {
+		t.Hash = []byte(aux.Hash)
+	}
+	return nil
 }
 
 func (r *ACLRole) Clone() *ACLRole {
@@ -806,6 +889,8 @@ func (r *ACLRole) SetHash(force bool) []byte {
 			srvid.AddToHash(hash)
 		}
 
+		r.EnterpriseMeta.addToHash(hash, false)
+
 		// Finalize the hash
 		hashVal := hash.Sum(nil)
 
@@ -828,7 +913,7 @@ func (r *ACLRole) EstimateSize() int {
 		size += srvid.EstimateSize()
 	}
 
-	return size
+	return size + r.EnterpriseMeta.estimateSize()
 }
 
 const (
@@ -888,6 +973,9 @@ type ACLBindingRule struct {
 	// upon the BindType.
 	BindName string
 
+	// Embedded Enterprise ACL metadata
+	EnterpriseMeta `mapstructure:",squash"`
+
 	// Embedded Raft Metadata
 	RaftIndex `hash:"ignore"`
 }
@@ -907,19 +995,23 @@ func (rules ACLBindingRules) Sort() {
 
 type ACLAuthMethodListStub struct {
 	Name        string
-	Description string
 	Type        string
+	DisplayName string `json:",omitempty"`
+	Description string `json:",omitempty"`
 	CreateIndex uint64
 	ModifyIndex uint64
+	EnterpriseMeta
 }
 
 func (p *ACLAuthMethod) Stub() *ACLAuthMethodListStub {
 	return &ACLAuthMethodListStub{
-		Name:        p.Name,
-		Description: p.Description,
-		Type:        p.Type,
-		CreateIndex: p.CreateIndex,
-		ModifyIndex: p.ModifyIndex,
+		Name:           p.Name,
+		Type:           p.Type,
+		DisplayName:    p.DisplayName,
+		Description:    p.Description,
+		CreateIndex:    p.CreateIndex,
+		ModifyIndex:    p.ModifyIndex,
+		EnterpriseMeta: p.EnterpriseMeta,
 	}
 }
 
@@ -949,16 +1041,70 @@ type ACLAuthMethod struct {
 	// Immutable once set and only settable during create.
 	Type string
 
+	// DisplayName is an optional name to use instead of the Name field when
+	// displaying information about this auth method in any kind of user
+	// interface.
+	DisplayName string `json:",omitempty"`
+
 	// Description is just an optional bunch of explanatory text.
-	Description string
+	Description string `json:",omitempty"`
+
+	// MaxTokenTTL this is the maximum life of a token created by this method.
+	MaxTokenTTL time.Duration `json:",omitempty"`
 
 	// Configuration is arbitrary configuration for the auth method. This
 	// should only contain primitive values and containers (such as lists and
 	// maps).
 	Config map[string]interface{}
 
+	// Embedded Enterprise ACL Meta
+	EnterpriseMeta `mapstructure:",squash"`
+
+	ACLAuthMethodEnterpriseFields `mapstructure:",squash"`
+
 	// Embedded Raft Metadata
 	RaftIndex `hash:"ignore"`
+}
+
+func (m *ACLAuthMethod) MarshalJSON() ([]byte, error) {
+	type Alias ACLAuthMethod
+	exported := &struct {
+		MaxTokenTTL string `json:",omitempty"`
+		*Alias
+	}{
+		MaxTokenTTL: m.MaxTokenTTL.String(),
+		Alias:       (*Alias)(m),
+	}
+	if m.MaxTokenTTL == 0 {
+		exported.MaxTokenTTL = ""
+	}
+
+	return json.Marshal(exported)
+}
+
+func (m *ACLAuthMethod) UnmarshalJSON(data []byte) (err error) {
+	type Alias ACLAuthMethod
+	aux := &struct {
+		MaxTokenTTL interface{}
+		*Alias
+	}{
+		Alias: (*Alias)(m),
+	}
+	if err = lib.UnmarshalJSON(data, &aux); err != nil {
+		return err
+	}
+	if aux.MaxTokenTTL != nil {
+		switch v := aux.MaxTokenTTL.(type) {
+		case string:
+			if m.MaxTokenTTL, err = time.ParseDuration(v); err != nil {
+				return err
+			}
+		case float64:
+			m.MaxTokenTTL = time.Duration(v)
+		}
+	}
+
+	return nil
 }
 
 type ACLReplicationType string
@@ -1017,6 +1163,7 @@ type ACLTokenGetRequest struct {
 	TokenID     string         // id used for the token lookup
 	TokenIDType ACLTokenIDType // The Type of ID used to lookup the token
 	Datacenter  string         // The datacenter to perform the request within
+	EnterpriseMeta
 	QueryOptions
 }
 
@@ -1028,6 +1175,7 @@ func (r *ACLTokenGetRequest) RequestDatacenter() string {
 type ACLTokenDeleteRequest struct {
 	TokenID    string // ID of the token to delete
 	Datacenter string // The datacenter to perform the request within
+	EnterpriseMeta
 	WriteRequest
 }
 
@@ -1043,6 +1191,8 @@ type ACLTokenListRequest struct {
 	Role          string // Role filter
 	AuthMethod    string // Auth Method filter
 	Datacenter    string // The datacenter to perform the request within
+	ACLAuthMethodEnterpriseMeta
+	EnterpriseMeta
 	QueryOptions
 }
 
@@ -1113,6 +1263,7 @@ type ACLTokenResponse struct {
 type ACLTokenBatchResponse struct {
 	Tokens   []*ACLToken
 	Redacted bool // whether the token secrets were redacted.
+	Removed  bool // whether any tokens were completely removed
 	QueryMeta
 }
 
@@ -1131,6 +1282,7 @@ func (r *ACLPolicySetRequest) RequestDatacenter() string {
 type ACLPolicyDeleteRequest struct {
 	PolicyID   string // The id of the policy to delete
 	Datacenter string // The datacenter to perform the request within
+	EnterpriseMeta
 	WriteRequest
 }
 
@@ -1140,8 +1292,10 @@ func (r *ACLPolicyDeleteRequest) RequestDatacenter() string {
 
 // ACLPolicyGetRequest is used at the RPC layer to perform policy read operations
 type ACLPolicyGetRequest struct {
-	PolicyID   string // id used for the policy lookup
+	PolicyID   string // id used for the policy lookup (one of PolicyID or PolicyName is allowed)
+	PolicyName string // name used for the policy lookup (one of PolicyID or PolicyName is allowed)
 	Datacenter string // The datacenter to perform the request within
+	EnterpriseMeta
 	QueryOptions
 }
 
@@ -1152,6 +1306,7 @@ func (r *ACLPolicyGetRequest) RequestDatacenter() string {
 // ACLPolicyListRequest is used at the RPC layer to request a listing of policies
 type ACLPolicyListRequest struct {
 	Datacenter string // The datacenter to perform the request within
+	EnterpriseMeta
 	QueryOptions
 }
 
@@ -1227,6 +1382,7 @@ func (r *ACLRoleSetRequest) RequestDatacenter() string {
 type ACLRoleDeleteRequest struct {
 	RoleID     string // id of the role to delete
 	Datacenter string // The datacenter to perform the request within
+	EnterpriseMeta
 	WriteRequest
 }
 
@@ -1239,6 +1395,7 @@ type ACLRoleGetRequest struct {
 	RoleID     string // id used for the role lookup (one of RoleID or RoleName is allowed)
 	RoleName   string // name used for the role lookup (one of RoleID or RoleName is allowed)
 	Datacenter string // The datacenter to perform the request within
+	EnterpriseMeta
 	QueryOptions
 }
 
@@ -1250,6 +1407,7 @@ func (r *ACLRoleGetRequest) RequestDatacenter() string {
 type ACLRoleListRequest struct {
 	Policy     string // Policy filter
 	Datacenter string // The datacenter to perform the request within
+	EnterpriseMeta
 	QueryOptions
 }
 
@@ -1317,6 +1475,7 @@ func (r *ACLBindingRuleSetRequest) RequestDatacenter() string {
 type ACLBindingRuleDeleteRequest struct {
 	BindingRuleID string // id of the rule to delete
 	Datacenter    string // The datacenter to perform the request within
+	EnterpriseMeta
 	WriteRequest
 }
 
@@ -1328,6 +1487,7 @@ func (r *ACLBindingRuleDeleteRequest) RequestDatacenter() string {
 type ACLBindingRuleGetRequest struct {
 	BindingRuleID string // id used for the rule lookup
 	Datacenter    string // The datacenter to perform the request within
+	EnterpriseMeta
 	QueryOptions
 }
 
@@ -1339,6 +1499,7 @@ func (r *ACLBindingRuleGetRequest) RequestDatacenter() string {
 type ACLBindingRuleListRequest struct {
 	AuthMethod string // optional filter
 	Datacenter string // The datacenter to perform the request within
+	EnterpriseMeta
 	QueryOptions
 }
 
@@ -1384,6 +1545,7 @@ func (r *ACLAuthMethodSetRequest) RequestDatacenter() string {
 type ACLAuthMethodDeleteRequest struct {
 	AuthMethodName string // name of the auth method to delete
 	Datacenter     string // The datacenter to perform the request within
+	EnterpriseMeta
 	WriteRequest
 }
 
@@ -1395,6 +1557,7 @@ func (r *ACLAuthMethodDeleteRequest) RequestDatacenter() string {
 type ACLAuthMethodGetRequest struct {
 	AuthMethodName string // name used for the auth method lookup
 	Datacenter     string // The datacenter to perform the request within
+	EnterpriseMeta
 	QueryOptions
 }
 
@@ -1405,6 +1568,7 @@ func (r *ACLAuthMethodGetRequest) RequestDatacenter() string {
 // ACLAuthMethodListRequest is used at the RPC layer to request a listing of auth methods
 type ACLAuthMethodListRequest struct {
 	Datacenter string // The datacenter to perform the request within
+	EnterpriseMeta
 	QueryOptions
 }
 
@@ -1433,12 +1597,19 @@ type ACLAuthMethodBatchSetRequest struct {
 // multiple auth method deletions
 type ACLAuthMethodBatchDeleteRequest struct {
 	AuthMethodNames []string
+	// While it may seem odd that AuthMethodNames is associated with a single
+	// EnterpriseMeta, it is okay as this struct is only ever used to
+	// delete a single entry. This is because AuthMethods unlike tokens, policies
+	// and roles are not replicated between datacenters and therefore never
+	// batch applied.
+	EnterpriseMeta
 }
 
 type ACLLoginParams struct {
 	AuthMethod  string
 	BearerToken string
 	Meta        map[string]string `json:",omitempty"`
+	EnterpriseMeta
 }
 
 type ACLLoginRequest struct {
@@ -1458,4 +1629,44 @@ type ACLLogoutRequest struct {
 
 func (r *ACLLogoutRequest) RequestDatacenter() string {
 	return r.Datacenter
+}
+
+type RemoteACLAuthorizationRequest struct {
+	Datacenter string
+	Requests   []ACLAuthorizationRequest
+	QueryOptions
+}
+
+type ACLAuthorizationRequest struct {
+	Resource acl.Resource
+	Segment  string `json:",omitempty"`
+	Access   string
+	EnterpriseMeta
+}
+
+type ACLAuthorizationResponse struct {
+	ACLAuthorizationRequest
+	Allow bool
+}
+
+func (r *RemoteACLAuthorizationRequest) RequestDatacenter() string {
+	return r.Datacenter
+}
+
+func CreateACLAuthorizationResponses(authz acl.Authorizer, requests []ACLAuthorizationRequest) ([]ACLAuthorizationResponse, error) {
+	responses := make([]ACLAuthorizationResponse, len(requests))
+	var ctx acl.AuthorizerContext
+
+	for idx, req := range requests {
+		req.FillAuthzContext(&ctx)
+		decision, err := acl.Enforce(authz, req.Resource, req.Segment, req.Access, &ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		responses[idx].ACLAuthorizationRequest = req
+		responses[idx].Allow = decision == acl.Allow
+	}
+
+	return responses, nil
 }
